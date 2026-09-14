@@ -10,11 +10,10 @@ import duckdb
 import streamlit as st
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = os.getenv("FINANCE_DB_PATH", str(BASE_DIR / "finance.duckdb"))
-
 @st.cache_resource
 def get_db() -> duckdb.DuckDBPyConnection:
-    con = duckdb.connect(DB_PATH)
+    md_token = st.secrets["MOTHERDUCK_TOKEN"]
+    con = duckdb.connect(f"md:my_db?motherduck_token={md_token}")
     con.execute("CREATE SEQUENCE IF NOT EXISTS transactions_id_seq START 1")
     con.execute("CREATE SEQUENCE IF NOT EXISTS net_worth_id_seq START 1")
     con.execute("CREATE SEQUENCE IF NOT EXISTS recurring_expenses_id_seq START 1")
