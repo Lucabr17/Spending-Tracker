@@ -130,6 +130,8 @@ def get_monthly_summary(year, month):
 def get_current_net_worth():
     row = fetch_one("""
         SELECT cash+investments+real_estate+other_assets
+             - COALESCE(student_loans,0) - COALESCE(credit_card_debt,0)
+             - COALESCE(other_liabilities,0)
         FROM net_worth ORDER BY snapshot_date DESC,id DESC LIMIT 1
     """)
     return float(row[0]) if row else None
@@ -181,7 +183,9 @@ def get_anomalies(year,month):
 def get_net_worth_history():
     return fetch_all("""
         SELECT snapshot_date,
-               cash+investments+real_estate+other_assets AS net_worth
+               cash+investments+real_estate+other_assets
+               - COALESCE(student_loans,0) - COALESCE(credit_card_debt,0)
+               - COALESCE(other_liabilities,0) AS net_worth
         FROM net_worth ORDER BY snapshot_date
     """)
 
@@ -224,18 +228,21 @@ def process_due_recurring(as_of_date):
                 due_date=add_months(due_date,12)
         execute("UPDATE recurring_expenses SET next_due_date=? WHERE id=?",[due_date,rid])
     return created
-    def get_net_worth_records() -> list[tuple]:
+
+def get_net_worth_records() -> list[tuple]:
     """Fetch all net worth snapshots with their IDs and breakdown."""
     return fetch_all("""
         SELECT id, snapshot_date, cash, investments, real_estate, other_assets,
                student_loans, credit_card_debt, other_liabilities,
-               (cash + investments + real_estate + other_assets - student_loans - credit_card_debt - other_liabilities) AS net_worth
+               (cash + investments + real_estate + other_assets
+                - COALESCE(student_loans,0) - COALESCE(credit_card_debt,0)
+                - COALESCE(other_liabilities,0)) AS net_worth
         FROM net_worth
         ORDER BY snapshot_date DESC, id DESC
     """)
 
-def update_net_worth_snapshot(snapshot_id, snapshot_date, cash, investments, 
-                               real_estate, other_assets, student_loans, 
+def update_net_worth_snapshot(snapshot_id, snapshot_date, cash, investments,
+                               real_estate, other_assets, student_loans,
                                credit_card_debt, other_liabilities):
     """Update an existing net worth entry."""
     execute("""
@@ -243,7 +250,7 @@ def update_net_worth_snapshot(snapshot_id, snapshot_date, cash, investments,
         SET snapshot_date=?, cash=?, investments=?, real_estate=?, other_assets=?,
             student_loans=?, credit_card_debt=?, other_liabilities=?
         WHERE id=?
-    """, [snapshot_date, cash, investments, real_estate, other_assets, 
+    """, [snapshot_date, cash, investments, real_estate, other_assets,
           student_loans, credit_card_debt, other_liabilities, snapshot_id])
 
 def delete_net_worth_snapshot(snapshot_id):
