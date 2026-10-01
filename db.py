@@ -73,7 +73,51 @@ def get_db() -> duckdb.DuckDBPyConnection:
     """)
     con.execute("CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(transaction_date)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_transactions_category ON transactions(category)")
+    _ensure_net_worth_items(con)
     return con
+
+def _ensure_net_worth_items(con):
+    con.execute("CREATE SEQUENCE IF NOT EXISTS net_worth_items_id_seq START 1")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS net_worth_items (
+            id BIGINT PRIMARY KEY DEFAULT nextval('net_worth_items_id_seq'),
+            snapshot_id BIGINT NOT NULL,
+            kind VARCHAR NOT NULL CHECK(kind IN ('Asset','Liability')),
+            name VARCHAR NOT NULL,
+            amount DECIMAL(18,2) NOT NULL CHECK(amount >= 0)
+        )
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_nw_items_snapshot ON net_worth_items(snapshot_id)")
+    rows = con.execute("""
+        SELECT id, cash, investments, real_estate, other_assets,
+               student_loans, credit_card_debt, other_liabilities
+        FROM net_worth n
+        WHERE NOT EXISTS (SELECT 1 FROM net_worth_items i WHERE i.snapshot_id = n.id)
+    """).fetchall()
+    mapping = [
+        ("Asset", "Cash", 1),
+        ("Asset", "Investments", 2),
+        ("Asset", "Real Estate", 3),
+        ("Asset", "Other Assets", 4),
+        ("Liability", "Student loans", 5),
+        ("Liability", "Credit card debt", 6),
+        ("Liability", "Other liabilities", 7),
+    ]
+    for row in rows:
+        inserted = 0
+        for kind, name, idx in mapping:
+            amount = float(row[idx] or 0)
+            if amount > 0:
+                con.execute(
+                    "INSERT INTO net_worth_items(snapshot_id, kind, name, amount) VALUES (?,?,?,?)",
+                    [row[0], kind, name, amount],
+                )
+                inserted += 1
+        if inserted == 0:
+            con.execute(
+                "INSERT INTO net_worth_items(snapshot_id, kind, name, amount) VALUES (?,?,?,?)",
+                [row[0], "Asset", "Cash", 0],
+            )
 
 def execute(sql: str, params: Iterable[Any] | None = None):
     return get_db().execute(sql, list(params) if params is not None else None)
@@ -128,13 +172,13 @@ def get_monthly_summary(year, month):
     return {"income":income,"expenses":expenses,"cash_flow":income-expenses}
 
 def get_current_net_worth():
-    row = fetch_one("""
-        SELECT cash+investments+real_estate+other_assets
-             - COALESCE(student_loans,0) - COALESCE(credit_card_debt,0)
-             - COALESCE(other_liabilities,0)
-        FROM net_worth ORDER BY snapshot_date DESC,id DESC LIMIT 1
+    row = fetch_one(f"""
+        SELECT {_NET_WORTH_SQL}
+        FROM net_worth
+        ORDER BY snapshot_date DESC, id DESC
+        LIMIT 1
     """)
-    return float(row[0]) if row else None
+    return float(row[0]) if row and row[0] is not None else None
 
 def get_category_spending(year,month):
     return fetch_all("""
@@ -181,24 +225,85 @@ def get_anomalies(year,month):
     """,[year,month,year,month])
 
 def get_net_worth_history():
-    return fetch_all("""
-        SELECT snapshot_date,
-               cash+investments+real_estate+other_assets
-               - COALESCE(student_loans,0) - COALESCE(credit_card_debt,0)
-               - COALESCE(other_liabilities,0) AS net_worth
-        FROM net_worth ORDER BY snapshot_date
+    return fetch_all(f"""
+        SELECT snapshot_date, {_NET_WORTH_SQL}
+        FROM net_worth
+        ORDER BY snapshot_date, id
     """)
 
-def insert_net_worth_snapshot(snapshot_date,cash,investments,real_estate,
-                              other_assets,student_loans,credit_card_debt,
-                              other_liabilities):
-    execute("""
+def _rollup_net_worth(items):
+    cash = inv = real = other = loans = cards = oliab = 0.0
+    for it in items:
+        name = it["name"].strip().lower()
+        amt = float(it["amount"])
+        if it["kind"] == "Asset":
+            if name in {"cash", "contanti", "checking"}:
+                cash += amt
+            elif any(k in name for k in ("invest", "etf", "broker", "azioni")):
+                inv += amt
+            elif any(k in name for k in ("real estate", "immobil", "house", "casa")):
+                real += amt
+            else:
+                other += amt
+        else:
+            if "student" in name or "studio" in name:
+                loans += amt
+            elif "credit" in name or "carta" in name:
+                cards += amt
+            else:
+                oliab += amt
+    return cash, inv, real, other, loans, cards, oliab
+
+def _insert_items(snapshot_id, items):
+    for it in items:
+        name = it["name"].strip()
+        if not name:
+            continue
+        execute(
+            "INSERT INTO net_worth_items(snapshot_id, kind, name, amount) VALUES (?,?,?,?)",
+            [snapshot_id, it["kind"], name, float(it["amount"])],
+        )
+
+def insert_net_worth_snapshot(snapshot_date, items):
+    cash, inv, real, other, loans, cards, oliab = _rollup_net_worth(items)
+    row = execute("""
         INSERT INTO net_worth
         (snapshot_date,cash,investments,real_estate,other_assets,
          student_loans,credit_card_debt,other_liabilities)
         VALUES (?,?,?,?,?,?,?,?)
-    """,[snapshot_date,cash,investments,real_estate,other_assets,
-         student_loans,credit_card_debt,other_liabilities])
+        RETURNING id
+    """, [snapshot_date, cash, inv, real, other, loans, cards, oliab]).fetchone()
+    _insert_items(row[0], items)
+    return row[0]
+
+def get_snapshot_items(snapshot_id):
+    return fetch_all("""
+        SELECT kind, name, amount
+        FROM net_worth_items
+        WHERE snapshot_id=?
+        ORDER BY CASE kind WHEN 'Asset' THEN 0 ELSE 1 END, id
+    """, [snapshot_id])
+
+def get_asset_history():
+    return fetch_all("""
+        SELECT n.snapshot_date, i.name, SUM(i.amount)
+        FROM net_worth_items i
+        JOIN net_worth n ON n.id = i.snapshot_id
+        WHERE i.kind='Asset'
+        GROUP BY n.snapshot_date, i.name
+        ORDER BY n.snapshot_date, i.name
+    """)
+
+_NET_WORTH_SQL = """
+COALESCE(
+    (SELECT SUM(CASE WHEN i.kind='Asset' THEN i.amount ELSE -i.amount END)
+     FROM net_worth_items i WHERE i.snapshot_id = net_worth.id),
+    net_worth.cash + net_worth.investments + net_worth.real_estate + net_worth.other_assets
+      - COALESCE(net_worth.student_loans,0)
+      - COALESCE(net_worth.credit_card_debt,0)
+      - COALESCE(net_worth.other_liabilities,0)
+)
+"""
 
 def process_due_recurring(as_of_date):
     due=fetch_all("""
@@ -230,29 +335,37 @@ def process_due_recurring(as_of_date):
     return created
 
 def get_net_worth_records() -> list[tuple]:
-    """Fetch all net worth snapshots with their IDs and breakdown."""
-    return fetch_all("""
-        SELECT id, snapshot_date, cash, investments, real_estate, other_assets,
-               student_loans, credit_card_debt, other_liabilities,
-               (cash + investments + real_estate + other_assets
-                - COALESCE(student_loans,0) - COALESCE(credit_card_debt,0)
-                - COALESCE(other_liabilities,0)) AS net_worth
+    """Fetch snapshots newest first: id, date, assets, liabilities, net worth."""
+    return fetch_all(f"""
+        SELECT id, snapshot_date,
+               COALESCE(
+                 (SELECT SUM(amount) FROM net_worth_items i
+                  WHERE i.snapshot_id=net_worth.id AND i.kind='Asset'),
+                 cash+investments+real_estate+other_assets
+               ),
+               COALESCE(
+                 (SELECT SUM(amount) FROM net_worth_items i
+                  WHERE i.snapshot_id=net_worth.id AND i.kind='Liability'),
+                 COALESCE(student_loans,0)+COALESCE(credit_card_debt,0)+COALESCE(other_liabilities,0)
+               ),
+               {_NET_WORTH_SQL}
         FROM net_worth
         ORDER BY snapshot_date DESC, id DESC
     """)
 
-def update_net_worth_snapshot(snapshot_id, snapshot_date, cash, investments,
-                               real_estate, other_assets, student_loans,
-                               credit_card_debt, other_liabilities):
-    """Update an existing net worth entry."""
+def update_net_worth_snapshot(snapshot_id, snapshot_date, items):
+    """Replace a snapshot date and its asset/liability lines."""
+    cash, inv, real, other, loans, cards, oliab = _rollup_net_worth(items)
     execute("""
         UPDATE net_worth
         SET snapshot_date=?, cash=?, investments=?, real_estate=?, other_assets=?,
             student_loans=?, credit_card_debt=?, other_liabilities=?
         WHERE id=?
-    """, [snapshot_date, cash, investments, real_estate, other_assets,
-          student_loans, credit_card_debt, other_liabilities, snapshot_id])
+    """, [snapshot_date, cash, inv, real, other, loans, cards, oliab, snapshot_id])
+    execute("DELETE FROM net_worth_items WHERE snapshot_id=?", [snapshot_id])
+    _insert_items(snapshot_id, items)
 
 def delete_net_worth_snapshot(snapshot_id):
-    """Delete a net worth entry by ID."""
+    """Delete a net worth entry and its lines."""
+    execute("DELETE FROM net_worth_items WHERE snapshot_id=?", [snapshot_id])
     execute("DELETE FROM net_worth WHERE id=?", [snapshot_id])
