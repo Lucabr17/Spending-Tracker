@@ -10,11 +10,12 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from db import (
-    delete_recurring_expense, delete_transaction, execute, fetch_all, fetch_one,
-    get_category_spending, get_current_net_worth, get_db, get_historical_month_count,
-    get_monthly_summary, get_net_worth_history, get_anomalies,
+    delete_net_worth_snapshot, delete_recurring_expense, delete_transaction,
+    execute, fetch_all, fetch_one, get_anomalies, get_category_spending,
+    get_current_net_worth, get_db, get_historical_month_count,
+    get_monthly_summary, get_net_worth_records,
     insert_net_worth_snapshot, insert_transaction, process_due_recurring,
-    update_transaction,
+    update_net_worth_snapshot, update_transaction,
 )
 from utils import (
     CATEGORIES, ask_gemini, auto_categorize, extract_image_transactions,
@@ -327,16 +328,64 @@ elif page=="📊 Command Center":
 # =====================================================================
 elif page=="💎 Wealth & Strategy":
     st.title("💎 Wealth Building & Strategy")
+    flash=st.session_state.pop("nw_flash", None)
+    if flash: st.success(flash)
+    st.header("1. Add a net worth snapshot")
     with st.form("nw",clear_on_submit=True):
-        d=st.date_input("Snapshot date",date.today()); st.subheader("Assets"); c1,c2,c3,c4=st.columns(4)
-        cash=c1.number_input("Cash",min_value=0.,step=100.); inv=c2.number_input("Investments",min_value=0.,step=100.); real=c3.number_input("Real Estate",min_value=0.,step=1000.); other=c4.number_input("Other Assets",min_value=0.,step=100.)
-        if st.form_submit_button("💾 Save Snapshot",use_container_width=True): insert_net_worth_snapshot(d,cash,inv,real,other,0,0,0); st.success("Snapshot salvato.")
-    h=get_net_worth_history()
-    if h:
-        st.metric("Latest Net Worth",euro(h[-1][1])); st.header("📊 Net Worth Growth — Stacked Asset Columns")
-        rows=fetch_all("SELECT snapshot_date,cash,investments,real_estate,other_assets FROM net_worth ORDER BY snapshot_date"); fig=go.Figure()
-        for idx,label in enumerate(["Cash","Investments","Real Estate","Other Assets"],1): fig.add_trace(go.Bar(x=[r[0] for r in rows],y=[float(r[idx]) for r in rows],name=label))
-        fig.update_layout(barmode="stack",title="Net Worth Growth by Asset Category",yaxis_title="€",height=520,legend_title="Asset category"); st.plotly_chart(fig,use_container_width=True)
+        d=st.date_input("Snapshot date",date.today(),key="nw_new_date")
+        st.subheader("Assets")
+        c1,c2,c3,c4=st.columns(4)
+        cash=c1.number_input("Cash",min_value=0.,step=100.,key="nw_new_cash")
+        inv=c2.number_input("Investments",min_value=0.,step=100.,key="nw_new_inv")
+        real=c3.number_input("Real Estate",min_value=0.,step=1000.,key="nw_new_real")
+        other=c4.number_input("Other Assets",min_value=0.,step=100.,key="nw_new_other")
+        st.subheader("Liabilities")
+        st.caption("Leave these at 0 if you have none. Net worth is assets minus liabilities.")
+        l1,l2,l3=st.columns(3)
+        loans=l1.number_input("Student loans",min_value=0.,step=100.,key="nw_new_loans")
+        cards=l2.number_input("Credit card debt",min_value=0.,step=100.,key="nw_new_cards")
+        oliab=l3.number_input("Other liabilities",min_value=0.,step=100.,key="nw_new_oliab")
+        if st.form_submit_button("💾 Save Snapshot",use_container_width=True):
+            insert_net_worth_snapshot(d,cash,inv,real,other,loans,cards,oliab)
+            st.session_state.nw_flash="Snapshot salvato."
+            st.rerun()
+    records=get_net_worth_records()
+    if records:
+        st.metric("Latest Net Worth",euro(records[0][9]))
+        st.header("📊 Net Worth Growth — Stacked Asset Columns")
+        rows=list(reversed(records))
+        fig=go.Figure()
+        for idx,label in enumerate(["Cash","Investments","Real Estate","Other Assets"],2):
+            fig.add_trace(go.Bar(x=[r[1] for r in rows],y=[float(r[idx] or 0) for r in rows],name=label))
+        fig.update_layout(barmode="stack",title="Net Worth Growth by Asset Category",yaxis_title="€",height=520,legend_title="Asset category")
+        st.plotly_chart(fig,use_container_width=True)
+        st.divider()
+        st.header("2. Correct a snapshot")
+        st.caption("Open a snapshot to fix a wrong date or amount, or delete one you added by mistake. The chart updates immediately.")
+        for rid,sd,cash,inv,real,other,loans,cards,oliab,nw in records:
+            sd = sd if isinstance(sd, date) else date.fromisoformat(str(sd)[:10])
+            with st.expander(f"{sd:%d/%m/%Y} · {euro(nw)}"):
+                with st.form(f"nw_edit_{rid}"):
+                    nd=st.date_input("Snapshot date",sd,key=f"nwd{rid}")
+                    st.caption("Assets")
+                    c1,c2,c3,c4=st.columns(4)
+                    ncash=c1.number_input("Cash",min_value=0.,value=float(cash or 0),step=100.,key=f"nwc{rid}")
+                    ninv=c2.number_input("Investments",min_value=0.,value=float(inv or 0),step=100.,key=f"nwi{rid}")
+                    nreal=c3.number_input("Real Estate",min_value=0.,value=float(real or 0),step=1000.,key=f"nwr{rid}")
+                    nother=c4.number_input("Other Assets",min_value=0.,value=float(other or 0),step=100.,key=f"nwo{rid}")
+                    st.caption("Liabilities")
+                    l1,l2,l3=st.columns(3)
+                    nloans=l1.number_input("Student loans",min_value=0.,value=float(loans or 0),step=100.,key=f"nwl{rid}")
+                    ncards=l2.number_input("Credit card debt",min_value=0.,value=float(cards or 0),step=100.,key=f"nwcc{rid}")
+                    noliab=l3.number_input("Other liabilities",min_value=0.,value=float(oliab or 0),step=100.,key=f"nwol{rid}")
+                    if st.form_submit_button("💾 Save changes",use_container_width=True):
+                        update_net_worth_snapshot(rid,nd,ncash,ninv,nreal,nother,nloans,ncards,noliab)
+                        st.session_state.nw_flash="Snapshot aggiornato."
+                        st.rerun()
+                if st.button("🗑️ Delete this snapshot",key=f"nwdel{rid}"):
+                    delete_net_worth_snapshot(rid)
+                    st.session_state.nw_flash="Snapshot eliminato."
+                    st.rerun()
     st.divider(); st.header("3. Paycheck Router"); existing={r[0]:float(r[1]) for r in fetch_all("SELECT account_name,percentage FROM routing_rules")}
     with st.form("routing"):
         c1,c2,c3=st.columns(3); p1=c1.number_input("Checking %",0.,100.,existing.get("Checking",50.),1.); p2=c2.number_input("Savings %",0.,100.,existing.get("Savings",30.),1.); p3=c3.number_input("Investments %",0.,100.,existing.get("Investments",20.),1.)
@@ -365,7 +414,7 @@ else:
         p["monthly"]=fetch_all("""SELECT category,SUM(amount) FROM transactions WHERE transaction_type='Expense' AND DATE_TRUNC('month',transaction_date)=DATE_TRUNC('month',CURRENT_DATE) GROUP BY category ORDER BY 2 DESC""")
         p["recent"]=fetch_all("""SELECT transaction_date,amount,category,transaction_type,description FROM transactions ORDER BY transaction_date DESC,id DESC LIMIT 25""")
         p["cashflow"]=fetch_all("""SELECT DATE_TRUNC('month',transaction_date),SUM(CASE WHEN transaction_type='Income' THEN amount ELSE 0 END),SUM(CASE WHEN transaction_type='Expense' THEN amount ELSE 0 END) FROM transactions GROUP BY 1 ORDER BY 1 DESC LIMIT 12""")
-        p["net_worth"]=fetch_all("""SELECT snapshot_date,cash+investments+real_estate+other_assets FROM net_worth ORDER BY snapshot_date DESC LIMIT 24""")
+        p["net_worth"]=fetch_all("""SELECT snapshot_date,cash+investments+real_estate+other_assets-COALESCE(student_loans,0)-COALESCE(credit_card_debt,0)-COALESCE(other_liabilities,0) FROM net_worth ORDER BY snapshot_date DESC LIMIT 24""")
         return json.dumps(p,default=str,ensure_ascii=False)
     for msg in st.session_state.ai_messages:
         with st.chat_message(msg["role"]):st.markdown(msg["content"])
