@@ -9,19 +9,27 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from db import (
-    delete_net_worth_snapshot, delete_recurring_expense, delete_transaction,
-    execute, fetch_all, fetch_one, get_anomalies, get_asset_history,
+    delete_recurring_expense, delete_transaction,
+    execute, fetch_all, fetch_one, get_anomalies,
     get_category_spending, get_db,
-    get_historical_month_count, get_monthly_summary, get_net_worth_history,
-    get_net_worth_records, get_snapshot_items, insert_net_worth_snapshot,
-    insert_transaction, process_due_recurring, update_net_worth_snapshot,
+    get_historical_month_count, get_monthly_summary,
+    insert_transaction, process_due_recurring,
     update_transaction,
 )
-from utils import (
-    CATEGORIES, EXPENSE_CATEGORIES, ask_gemini, categories_for,
-    extract_image_transactions, get_secret, parse_natural_language,
-    transaction_fingerprint,
-)
+try:
+    from utils import (
+        CATEGORIES, EXPENSE_CATEGORIES, ask_gemini, categories_for,
+        extract_image_transactions, get_secret, parse_natural_language,
+        transaction_fingerprint,
+    )
+except ImportError:
+    from utils import (
+        CATEGORIES, ask_gemini, extract_image_transactions, get_secret,
+        parse_natural_language, transaction_fingerprint,
+    )
+    EXPENSE_CATEGORIES=[c for c in CATEGORIES if c not in {"Wage","Other Income"}]
+    def categories_for(transaction_type):
+        return ["Wage","Other Income"] if transaction_type=="Income" else EXPENSE_CATEGORIES
 
 st.set_page_config(page_title="Personal Finance OS",page_icon="💰",
                    layout="wide",initial_sidebar_state="expanded")
@@ -122,6 +130,131 @@ def merge_items(items):
             merged.append(dict(it))
     return merged
 
+def ensure_net_worth_items():
+    execute("CREATE SEQUENCE IF NOT EXISTS net_worth_items_id_seq START 1")
+    execute("""
+        CREATE TABLE IF NOT EXISTS net_worth_items (
+            id BIGINT PRIMARY KEY DEFAULT nextval('net_worth_items_id_seq'),
+            snapshot_id BIGINT NOT NULL,
+            kind VARCHAR NOT NULL CHECK(kind IN ('Asset','Liability')),
+            name VARCHAR NOT NULL,
+            amount DECIMAL(18,2) NOT NULL CHECK(amount >= 0)
+        )
+    """)
+    rows=fetch_all("""
+        SELECT id, cash, investments, real_estate, other_assets,
+               student_loans, credit_card_debt, other_liabilities
+        FROM net_worth n
+        WHERE NOT EXISTS (SELECT 1 FROM net_worth_items i WHERE i.snapshot_id=n.id)
+    """)
+    mapping=[
+        ("Asset","Cash",1),("Asset","Investments",2),("Asset","Real Estate",3),
+        ("Asset","Other Assets",4),("Liability","Student loans",5),
+        ("Liability","Credit card debt",6),("Liability","Other liabilities",7),
+    ]
+    for row in rows:
+        inserted=0
+        for kind,name,idx in mapping:
+            amount=float(row[idx] or 0)
+            if amount>0:
+                execute("INSERT INTO net_worth_items(snapshot_id,kind,name,amount) VALUES (?,?,?,?)",[row[0],kind,name,amount])
+                inserted+=1
+        if inserted==0:
+            execute("INSERT INTO net_worth_items(snapshot_id,kind,name,amount) VALUES (?,?,?,?)",[row[0],"Asset","Cash",0])
+
+def _rollup(items):
+    cash=inv=real=other=loans=cards=oliab=0.0
+    for it in items:
+        name=it["name"].strip().lower(); amt=float(it["amount"])
+        if it["kind"]=="Asset":
+            if name in {"cash","contanti","checking"}: cash+=amt
+            elif any(k in name for k in ("invest","etf","broker","azioni")): inv+=amt
+            elif any(k in name for k in ("real estate","immobil","house","casa")): real+=amt
+            else: other+=amt
+        else:
+            if "student" in name or "studio" in name: loans+=amt
+            elif "credit" in name or "carta" in name: cards+=amt
+            else: oliab+=amt
+    return cash,inv,real,other,loans,cards,oliab
+
+def _insert_items(snapshot_id, items):
+    for it in items:
+        name=it["name"].strip()
+        if name:
+            execute("INSERT INTO net_worth_items(snapshot_id,kind,name,amount) VALUES (?,?,?,?)",[snapshot_id,it["kind"],name,float(it["amount"])])
+
+def save_snapshot(snapshot_date, items):
+    ensure_net_worth_items()
+    cash,inv,real,other,loans,cards,oliab=_rollup(items)
+    execute("""
+        INSERT INTO net_worth
+        (snapshot_date,cash,investments,real_estate,other_assets,student_loans,credit_card_debt,other_liabilities)
+        VALUES (?,?,?,?,?,?,?,?)
+    """,[snapshot_date,cash,inv,real,other,loans,cards,oliab])
+    sid=fetch_one("SELECT id FROM net_worth ORDER BY id DESC LIMIT 1")[0]
+    _insert_items(sid, items)
+
+def replace_snapshot(snapshot_id, snapshot_date, items):
+    ensure_net_worth_items()
+    cash,inv,real,other,loans,cards,oliab=_rollup(items)
+    execute("""
+        UPDATE net_worth
+        SET snapshot_date=?,cash=?,investments=?,real_estate=?,other_assets=?,
+            student_loans=?,credit_card_debt=?,other_liabilities=?
+        WHERE id=?
+    """,[snapshot_date,cash,inv,real,other,loans,cards,oliab,snapshot_id])
+    execute("DELETE FROM net_worth_items WHERE snapshot_id=?",[snapshot_id])
+    _insert_items(snapshot_id, items)
+
+def remove_snapshot(snapshot_id):
+    ensure_net_worth_items()
+    execute("DELETE FROM net_worth_items WHERE snapshot_id=?",[snapshot_id])
+    execute("DELETE FROM net_worth WHERE id=?",[snapshot_id])
+
+def get_snapshot_items(snapshot_id):
+    ensure_net_worth_items()
+    return fetch_all("""
+        SELECT kind,name,amount FROM net_worth_items
+        WHERE snapshot_id=?
+        ORDER BY CASE kind WHEN 'Asset' THEN 0 ELSE 1 END, id
+    """,[snapshot_id])
+
+def get_asset_history():
+    ensure_net_worth_items()
+    return fetch_all("""
+        SELECT n.snapshot_date,i.name,SUM(i.amount)
+        FROM net_worth_items i JOIN net_worth n ON n.id=i.snapshot_id
+        WHERE i.kind='Asset'
+        GROUP BY n.snapshot_date,i.name
+        ORDER BY n.snapshot_date,i.name
+    """)
+
+def get_net_worth_history():
+    ensure_net_worth_items()
+    return fetch_all("""
+        SELECT n.snapshot_date,
+          COALESCE((SELECT SUM(CASE WHEN i.kind='Asset' THEN i.amount ELSE -i.amount END)
+                    FROM net_worth_items i WHERE i.snapshot_id=n.id),
+                   n.cash+n.investments+n.real_estate+n.other_assets
+                   -COALESCE(n.student_loans,0)-COALESCE(n.credit_card_debt,0)-COALESCE(n.other_liabilities,0))
+        FROM net_worth n ORDER BY n.snapshot_date,n.id
+    """)
+
+def get_net_worth_records():
+    ensure_net_worth_items()
+    return fetch_all("""
+        SELECT n.id,n.snapshot_date,
+          COALESCE((SELECT SUM(amount) FROM net_worth_items i WHERE i.snapshot_id=n.id AND i.kind='Asset'),
+                   n.cash+n.investments+n.real_estate+n.other_assets),
+          COALESCE((SELECT SUM(amount) FROM net_worth_items i WHERE i.snapshot_id=n.id AND i.kind='Liability'),
+                   COALESCE(n.student_loans,0)+COALESCE(n.credit_card_debt,0)+COALESCE(n.other_liabilities,0)),
+          COALESCE((SELECT SUM(CASE WHEN i.kind='Asset' THEN i.amount ELSE -i.amount END)
+                    FROM net_worth_items i WHERE i.snapshot_id=n.id),
+                   n.cash+n.investments+n.real_estate+n.other_assets
+                   -COALESCE(n.student_loans,0)-COALESCE(n.credit_card_debt,0)-COALESCE(n.other_liabilities,0))
+        FROM net_worth n ORDER BY n.snapshot_date DESC,n.id DESC
+    """)
+
 PIE_COLORS=["#16a34a","#2563eb","#0891b2","#d97706","#dc2626","#7c3aed","#0f766e","#db2777","#64748b","#ca8a04"]
 
 def years():
@@ -177,9 +310,6 @@ with st.sidebar:
     st.divider()
     st.caption(f"DuckDB · {date.today():%d/%m/%Y}")
 
-# =====================================================================
-# DASHBOARD
-# =====================================================================
 if page=="🏠 Dashboard":
     st.title("🏠 Financial Dashboard")
     t=date.today(); s=get_monthly_summary(t.year,t.month); ps=get_monthly_summary(*previous_month(t).timetuple()[:2])
@@ -214,9 +344,6 @@ if page=="🏠 Dashboard":
         yf.update_layout(barmode="group",title="Overall Yearly Income vs Expenses",yaxis_title="€")
         st.plotly_chart(style_chart(yf,450),use_container_width=True)
 
-# =====================================================================
-# DATA ENTRY
-# =====================================================================
 elif page=="📝 Data Entry":
     st.title("📝 Data Entry")
     tab_quick, tab_import, tab_rec, tab_tx = st.tabs(["Quick add", "Import", "Recurring", "Transactions"])
@@ -424,9 +551,6 @@ elif page=="📝 Data Entry":
                 st.toast("Eliminata")
                 st.rerun()
 
-# =====================================================================
-# REPORTS
-# =====================================================================
 elif page=="📊 Reports":
     st.title("📊 Reports")
     mode=st.radio("View",["Month","Year"],horizontal=True,key="cc_mode")
@@ -479,9 +603,7 @@ elif page=="📊 Reports":
             anomalies=get_anomalies(y,m)
             if not anomalies: st.success("Nessuna anomalia significativa.")
             for cat,current,avg,std in anomalies: st.warning(f"**{cat}** — {euro(current)} vs media {euro(avg)}.")
-# =====================================================================
-# WEALTH
-# =====================================================================
+
 elif page=="💎 Wealth & Strategy":
     st.title("💎 Wealth Building & Strategy")
     st.header("1. Add a snapshot")
@@ -517,7 +639,7 @@ elif page=="💎 Wealth & Strategy":
             if not items:
                 st.warning("Enter at least one amount.")
             else:
-                insert_net_worth_snapshot(d, items)
+                save_snapshot(d, items)
                 st.session_state.nw_reset_new=True
                 st.toast("Snapshot salvato")
                 st.rerun()
@@ -596,12 +718,12 @@ elif page=="💎 Wealth & Strategy":
                 if not items:
                     st.warning("Enter at least one amount, or delete the snapshot.")
                 else:
-                    update_net_worth_snapshot(pick, nd, items)
+                    replace_snapshot(pick, nd, items)
                     st.session_state.nw_edit_id=None
                     st.toast("Snapshot aggiornato")
                     st.rerun()
         if b2.button("Delete this snapshot", key="nw_edit_delete"):
-            delete_net_worth_snapshot(pick)
+            remove_snapshot(pick)
             st.session_state.nw_edit_id=None
             st.toast("Snapshot eliminato")
             st.rerun()
@@ -618,9 +740,6 @@ elif page=="💎 Wealth & Strategy":
     paycheck=st.number_input("Net paycheck",min_value=0.,step=100.,format="%.2f")
     if abs(p1+p2+p3-100)<1e-9:
         c1,c2,c3=st.columns(3); c1.metric("Checking",euro(paycheck*p1/100),f"{p1:.1f}%"); c2.metric("Savings",euro(paycheck*p2/100),f"{p2:.1f}%"); c3.metric("Investments",euro(paycheck*p3/100),f"{p3:.1f}%")
-# =====================================================================
-# AI
-# =====================================================================
 else:
     st.title("🤖 AI Insights")
     st.caption("Natural-language questions over a controlled, read-only financial context.")
@@ -630,6 +749,7 @@ else:
         else:st.warning("Gemini not configured")
         if st.button("🧹 Clear Chat"):st.session_state.ai_messages=[];st.rerun()
     def context():
+        ensure_net_worth_items()
         p={}
         p["weekly"]=fetch_all("""SELECT category,SUM(amount) FROM transactions WHERE transaction_type='Expense' AND transaction_date>=CURRENT_DATE-INTERVAL 7 DAY GROUP BY category ORDER BY 2 DESC""")
         p["monthly"]=fetch_all("""SELECT category,SUM(amount) FROM transactions WHERE transaction_type='Expense' AND DATE_TRUNC('month',transaction_date)=DATE_TRUNC('month',CURRENT_DATE) GROUP BY category ORDER BY 2 DESC""")
