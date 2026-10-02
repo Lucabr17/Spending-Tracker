@@ -73,15 +73,19 @@ def delta_line(current, previous, invert=False):
     sign="+" if d>0 else ""
     return f'<div class="sub" style="color:{color}">{sign}{euro(d)} vs last month</div>'
 
+INCOME_COLOR="rgba(22,163,74,0.45)"
+EXPENSE_COLOR="rgba(220,38,38,0.45)"
+
 def style_chart(fig, height=480):
     fig.update_layout(
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
         font=dict(color="#0f172a"),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
-        margin=dict(l=8, r=8, t=56, b=8), height=height,
+        title=dict(x=0, xanchor="left", y=0.97),
+        legend=dict(orientation="h", yanchor="top", y=-0.18, x=0, bgcolor="rgba(0,0,0,0)"),
+        margin=dict(l=64, r=16, t=56, b=64), height=height,
     )
-    fig.update_xaxes(showgrid=False)
-    fig.update_yaxes(gridcolor="rgba(148,163,184,.35)", zeroline=False)
+    fig.update_xaxes(showgrid=False, automargin=True)
+    fig.update_yaxes(gridcolor="rgba(148,163,184,.28)", zeroline=False, automargin=True, title_standoff=12)
     return fig
 
 def new_line(name="", amount=0.0):
@@ -310,6 +314,9 @@ with st.sidebar:
     st.divider()
     st.caption(f"DuckDB · {date.today():%d/%m/%Y}")
 
+# =====================================================================
+# DASHBOARD
+# =====================================================================
 if page=="🏠 Dashboard":
     st.title("🏠 Financial Dashboard")
     t=date.today(); s=get_monthly_summary(t.year,t.month); ps=get_monthly_summary(*previous_month(t).timetuple()[:2])
@@ -332,18 +339,21 @@ if page=="🏠 Dashboard":
     y=st.selectbox("Select year",years(),key="dash_y")
     r=monthly_rows(y)
     fig=go.Figure()
-    fig.add_trace(go.Bar(x=[month_name(x[0]) for x in r],y=[float(x[1]) for x in r],name="Income",marker_color="#16a34a"))
-    fig.add_trace(go.Bar(x=[month_name(x[0]) for x in r],y=[float(x[2]) for x in r],name="Expenses",marker_color="#dc2626"))
+    fig.add_trace(go.Bar(x=[month_name(x[0]) for x in r],y=[float(x[1]) for x in r],name="Income",marker_color=INCOME_COLOR))
+    fig.add_trace(go.Bar(x=[month_name(x[0]) for x in r],y=[float(x[2]) for x in r],name="Expenses",marker_color=EXPENSE_COLOR))
     fig.update_layout(barmode="group",title=f"Monthly Income vs Expenses — {y}",yaxis_title="€")
     st.plotly_chart(style_chart(fig,500),use_container_width=True)
     yr=yearly_rows()
     if yr:
         yf=go.Figure()
-        yf.add_trace(go.Bar(x=[str(x[0]) for x in yr],y=[float(x[1]) for x in yr],name="Income",marker_color="#16a34a"))
-        yf.add_trace(go.Bar(x=[str(x[0]) for x in yr],y=[float(x[2]) for x in yr],name="Expenses",marker_color="#dc2626"))
+        yf.add_trace(go.Bar(x=[str(x[0]) for x in yr],y=[float(x[1]) for x in yr],name="Income",marker_color=INCOME_COLOR))
+        yf.add_trace(go.Bar(x=[str(x[0]) for x in yr],y=[float(x[2]) for x in yr],name="Expenses",marker_color=EXPENSE_COLOR))
         yf.update_layout(barmode="group",title="Overall Yearly Income vs Expenses",yaxis_title="€")
         st.plotly_chart(style_chart(yf,450),use_container_width=True)
 
+# =====================================================================
+# DATA ENTRY
+# =====================================================================
 elif page=="📝 Data Entry":
     st.title("📝 Data Entry")
     tab_quick, tab_import, tab_rec, tab_tx = st.tabs(["Quick add", "Import", "Recurring", "Transactions"])
@@ -551,6 +561,9 @@ elif page=="📝 Data Entry":
                 st.toast("Eliminata")
                 st.rerun()
 
+# =====================================================================
+# REPORTS
+# =====================================================================
 elif page=="📊 Reports":
     st.title("📊 Reports")
     mode=st.radio("View",["Month","Year"],horizontal=True,key="cc_mode")
@@ -603,7 +616,9 @@ elif page=="📊 Reports":
             anomalies=get_anomalies(y,m)
             if not anomalies: st.success("Nessuna anomalia significativa.")
             for cat,current,avg,std in anomalies: st.warning(f"**{cat}** — {euro(current)} vs media {euro(avg)}.")
-
+# =====================================================================
+# WEALTH
+# =====================================================================
 elif page=="💎 Wealth & Strategy":
     st.title("💎 Wealth Building & Strategy")
     st.header("1. Add a snapshot")
@@ -740,6 +755,9 @@ elif page=="💎 Wealth & Strategy":
     paycheck=st.number_input("Net paycheck",min_value=0.,step=100.,format="%.2f")
     if abs(p1+p2+p3-100)<1e-9:
         c1,c2,c3=st.columns(3); c1.metric("Checking",euro(paycheck*p1/100),f"{p1:.1f}%"); c2.metric("Savings",euro(paycheck*p2/100),f"{p2:.1f}%"); c3.metric("Investments",euro(paycheck*p3/100),f"{p3:.1f}%")
+# =====================================================================
+# AI
+# =====================================================================
 else:
     st.title("🤖 AI Insights")
     st.caption("Natural-language questions over a controlled, read-only financial context.")
