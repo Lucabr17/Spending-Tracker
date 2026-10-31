@@ -15,7 +15,7 @@ import re
 from datetime import timedelta
 
 import db as _db
-from db import fetch_all, fetch_one, get_anomalies, get_db, get_historical_month_count
+from db import fetch_all, fetch_one, get_db, get_historical_month_count
 
 # Every write goes through these wrappers so cached pages refresh straight away.
 def _writes(fn):
@@ -401,7 +401,7 @@ def kpi(col, label, value, delta=None, pct=None, sub=None, accent="#2563eb", inv
         p=f" · {pct:+.1f}%" if pct is not None else ""
         d=f'<div class="kpi-delta" style="color:{color}">{arrow} {delta_text or signed_euro(delta)}{p}</div>'
     s=f'<div class="kpi-sub">{sub}</div>' if sub else ""
-    v=text if text is not None else euro(value)
+    v=text if text is not None else (("−"+euro(abs(value))) if float(value)<0 else euro(value))
     col.markdown(f'<div class="kpi" style="--accent:{accent}"><div class="kpi-label">{label}</div>'
                  f'<div class="kpi-value">{v}</div>{d}{s}</div>', unsafe_allow_html=True)
 
@@ -409,29 +409,84 @@ def add_months(d, n):
     t=d.year*12+d.month-1+n
     return date(t//12, t%12+1, 1)
 
-def tx_totals(start, end):
-    r=_q("""SELECT COALESCE(SUM(CASE WHEN transaction_type='Income' THEN amount END),0),
-                   COALESCE(SUM(CASE WHEN transaction_type='Expense' THEN amount END),0), COUNT(*)
-            FROM transactions WHERE transaction_date>=? AND transaction_date<?""", [start, end])[0]
-    inc, exp=float(r[0]), float(r[1])
-    return {"income": inc, "expenses": exp, "net": inc-exp,
-            "rate": (inc-exp)/inc*100 if inc else None, "count": int(r[2])}
+# Money moved into investments is saving, not spending.
+NON_SPENDING=("Investing",)
+_NS_SQL="('"+"','".join(NON_SPENDING)+"')"
 
-def cat_totals(start, end, typ="Expense"):
-    return {c: float(v) for c, v in _q("""SELECT category, SUM(amount) FROM transactions
-        WHERE transaction_type=? AND transaction_date>=? AND transaction_date<? GROUP BY 1 ORDER BY 2 DESC""",
+def tx_totals(start, end):
+    r=_q(f"""SELECT COALESCE(SUM(CASE WHEN transaction_type='Income' THEN amount END),0),
+                   COALESCE(SUM(CASE WHEN transaction_type='Expense' AND category NOT IN {_NS_SQL} THEN amount END),0),
+                   COALESCE(SUM(CASE WHEN transaction_type='Expense' AND category IN {_NS_SQL} THEN amount END),0),
+                   COUNT(*)
+            FROM transactions WHERE transaction_date>=? AND transaction_date<?""", [start, end])[0]
+    inc, spend, inv=float(r[0]), float(r[1]), float(r[2])
+    saved=inc-spend
+    return {"income": inc, "expenses": spend, "invested": inv, "net": saved, "cash_left": saved-inv,
+            "rate": saved/inc*100 if inc else None, "invest_rate": inv/inc*100 if inc else None, "count": int(r[3])}
+
+def cat_totals(start, end, typ="Expense", include_investing=False):
+    extra="" if (include_investing or typ!="Expense") else f" AND category NOT IN {_NS_SQL}"
+    return {c: float(v) for c, v in _q(f"""SELECT category, SUM(amount) FROM transactions
+        WHERE transaction_type=? AND transaction_date>=? AND transaction_date<?{extra} GROUP BY 1 ORDER BY 2 DESC""",
         [typ, start, end])}
 
 def monthly_flow(start, end):
-    rows=_q("""SELECT DATE_TRUNC('month', transaction_date)::DATE,
+    """[(month, income, spending, invested)]"""
+    rows=_q(f"""SELECT DATE_TRUNC('month', transaction_date)::DATE,
                       SUM(CASE WHEN transaction_type='Income' THEN amount ELSE 0 END),
-                      SUM(CASE WHEN transaction_type='Expense' THEN amount ELSE 0 END)
+                      SUM(CASE WHEN transaction_type='Expense' AND category NOT IN {_NS_SQL} THEN amount ELSE 0 END),
+                      SUM(CASE WHEN transaction_type='Expense' AND category IN {_NS_SQL} THEN amount ELSE 0 END)
                FROM transactions WHERE transaction_date>=? AND transaction_date<? GROUP BY 1""", [start, end])
-    got={as_date(m): (float(i), float(e)) for m, i, e in rows}
+    got={as_date(m): (float(i), float(e), float(v)) for m, i, e, v in rows}
     out, d=[], start
     while d<end:
-        out.append((d, *got.get(d, (0.0, 0.0)))); d=add_months(d, 1)
+        out.append((d, *got.get(d, (0.0, 0.0, 0.0)))); d=add_months(d, 1)
     return out
+
+def flow_chart(flow, height=400):
+    x=[f[0] for f in flow]
+    fig=go.Figure()
+    fig.add_trace(go.Bar(name="Income", x=x, y=[f[1] for f in flow], marker_color="#22c55e",
+                         hovertemplate="Income € %{y:,.0f}<extra></extra>"))
+    fig.add_trace(go.Bar(name="Spending", x=x, y=[f[2] for f in flow], marker_color="#f87171",
+                         hovertemplate="Spending € %{y:,.0f}<extra></extra>"))
+    fig.add_trace(go.Bar(name="Invested", x=x, y=[f[3] for f in flow], marker_color="#a78bfa",
+                         hovertemplate="Invested € %{y:,.0f}<extra></extra>"))
+    fig.add_trace(go.Scatter(name="Saved (income − spending)", x=x, y=[f[1]-f[2] for f in flow], mode="lines+markers",
+                             line=dict(color="#0f172a", width=2.5, shape="spline"),
+                             hovertemplate="Saved € %{y:,.0f}<extra></extra>"))
+    fig.update_layout(barmode="group", hovermode="x unified", bargap=0.25, bargroupgap=0.05)
+    style_chart(fig, height)
+    fig.update_layout(margin=dict(t=10))
+    fig.update_xaxes(dtick="M1", tickformat="%b\n%Y")
+    fig.update_yaxes(tickprefix="€ ", separatethousands=True)
+    return fig
+
+def spending_anomalies(year, month):
+    """Categories this month well above their usual monthly spend (investing excluded)."""
+    try:
+        return _q(f"""
+            WITH monthly_category AS (
+                SELECT DATE_TRUNC('month', transaction_date) AS mth, category, SUM(amount) AS spending
+                FROM transactions
+                WHERE transaction_type='Expense' AND category NOT IN {_NS_SQL}
+                GROUP BY 1, 2
+            ),
+            historical AS (
+                SELECT category, AVG(spending) AS avg_spend, STDDEV_POP(spending) AS std_spend
+                FROM monthly_category WHERE mth < MAKE_DATE(?, ?, 1)
+                GROUP BY category
+            ),
+            current_month AS (
+                SELECT category, spending AS current_spend
+                FROM monthly_category WHERE mth = MAKE_DATE(?, ?, 1)
+            )
+            SELECT c.category, c.current_spend, h.avg_spend, COALESCE(h.std_spend, 0)
+            FROM current_month c JOIN historical h USING (category)
+            WHERE c.current_spend > h.avg_spend + GREATEST(COALESCE(h.std_spend, 0)*2, h.avg_spend*0.5)
+            ORDER BY c.current_spend DESC""", [year, month, year, month])
+    except Exception:
+        return None
 
 def tx_months():
     ms=[as_date(r[0]) for r in _q("SELECT DISTINCT DATE_TRUNC('month', transaction_date)::DATE FROM transactions ORDER BY 1 DESC")]
@@ -634,13 +689,18 @@ if page=="🏠 Dashboard":
     nm=add_months(MONTH_START, 1); pm=add_months(MONTH_START, -1)
     cur=tx_totals(MONTH_START, nm)
     prev=tx_totals(pm, min(pm+timedelta(days=TODAY.day), MONTH_START))
-    k1,k2,k3,k4=st.columns(4)
+    k1,k2,k3,k4,k5=st.columns(5)
     kpi(k1, "💵 Money in", cur["income"], cur["income"]-prev["income"], pct_change(cur["income"], prev["income"]),
         "This month", "#16a34a")
-    kpi(k2, "💳 Money out", cur["expenses"], cur["expenses"]-prev["expenses"], pct_change(cur["expenses"], prev["expenses"]),
-        "This month", "#dc2626", invert=True)
-    kpi(k3, "🔄 Net cash flow", cur["net"], cur["net"]-prev["net"], None,
-        f"Savings rate {cur['rate']:.0f}%" if cur["rate"] is not None else "No income yet this month", "#2563eb")
+    kpi(k2, "💳 Spending", cur["expenses"], cur["expenses"]-prev["expenses"], pct_change(cur["expenses"], prev["expenses"]),
+        "Excludes investing", "#dc2626", invert=True)
+    kpi(k3, "📈 Invested", cur["invested"], cur["invested"]-prev["invested"], None,
+        f"{cur['invest_rate']:.0f}% of income" if cur["invest_rate"] is not None else "This month", "#7c3aed")
+    rate, prate=cur["rate"], prev["rate"]
+    kpi(k4, "🐷 Savings rate", 0, None if rate is None or prate is None else rate-prate, None,
+        f"Saved {euro(cur['net'])} · {euro(cur['cash_left'])} kept as cash", "#2563eb",
+        text="—" if rate is None else f"{rate:.0f}%",
+        delta_text=None if rate is None or prate is None else f"{rate-prate:+.1f} pp")
     recs=get_net_worth_records()
     if recs:
         types=get_account_types(); dates_, series_, kinds_=build_series(types)
@@ -648,33 +708,20 @@ if page=="🏠 Dashboard":
         c_now=sum(v.get(last,0) for n,v in series_.items() if kinds_[n]=="Cash")
         i_now=sum(v.get(last,0) for n,v in series_.items() if kinds_[n]=="Investment")
         nwv, nwp=float(recs[0][4]), (float(recs[1][4]) if len(recs)>1 else None)
-        kpi(k4, "💎 Net worth", nwv, None if nwp is None else nwv-nwp, pct_change(nwv, nwp),
+        kpi(k5, "💎 Net worth", nwv, None if nwp is None else nwv-nwp, pct_change(nwv, nwp),
             f"Cash {euro(c_now)} · Invested {euro(i_now)}", "#0f172a")
     else:
-        kpi(k4, "💎 Net worth", 0, sub="Add a snapshot in Wealth", accent="#0f172a", text="—")
+        kpi(k5, "💎 Net worth", 0, sub="Add a snapshot in Wealth", accent="#0f172a", text="—")
     st.write("")
 
     left, right=st.columns([2, 1], gap="large")
     with left:
         card("📈 Last 12 months")
-        flow=monthly_flow(add_months(MONTH_START, -11), nm)
-        x=[m for m,_,_ in flow]
-        fig=go.Figure()
-        fig.add_trace(go.Bar(name="Income", x=x, y=[i for _,i,_ in flow], marker_color="#22c55e",
-                             hovertemplate="Income € %{y:,.0f}<extra></extra>"))
-        fig.add_trace(go.Bar(name="Expenses", x=x, y=[e for _,_,e in flow], marker_color="#f87171",
-                             hovertemplate="Expenses € %{y:,.0f}<extra></extra>"))
-        fig.add_trace(go.Scatter(name="Net", x=x, y=[i-e for _,i,e in flow], mode="lines+markers",
-                                 line=dict(color="#0f172a", width=2.5, shape="spline"),
-                                 hovertemplate="Net € %{y:,.0f}<extra></extra>"))
-        fig.update_layout(barmode="group", hovermode="x unified", bargap=0.3)
-        style_chart(fig, 400)
-        fig.update_layout(margin=dict(t=10))
-        fig.update_xaxes(dtick="M1", tickformat="%b\n%Y")
-        fig.update_yaxes(tickprefix="€ ", separatethousands=True)
+        fig=flow_chart(monthly_flow(add_months(MONTH_START, -11), nm), 400)
         st.plotly_chart(fig, width="stretch", config=PLOT_CONFIG)
     with right:
         card("🧾 Where it went this month")
+        st.caption("Spending only — investing is shown separately.")
         cats=cat_totals(MONTH_START, nm)
         if cats:
             top=list(cats.items())[:8][::-1]
@@ -953,7 +1000,7 @@ elif page=="📝 Data Entry":
             if suggest and avg3.get(c): return float(-(-avg3[c]//10)*10)   # round up to €10
             return 0.0
         bdf=pd.DataFrame([{"Category": c, "Monthly budget": suggested(c), "Spent this month": spent.get(c, 0.0),
-                           "3-month average": avg3.get(c, 0.0)} for c in EXPENSE_CATEGORIES])
+                           "3-month average": avg3.get(c, 0.0)} for c in EXPENSE_CATEGORIES if c not in NON_SPENDING])
         bed=st.data_editor(bdf, key=f"bud_editor_{bv}", hide_index=True, width="stretch", num_rows="fixed",
                            disabled=["Category", "Spent this month", "3-month average"],
                            column_config={
@@ -1001,9 +1048,12 @@ elif page=="📝 Data Entry":
             ORDER BY transaction_date DESC, id DESC LIMIT 1000
         """, [start, start, end, end, None if typ_f=="All" else typ_f, None if typ_f=="All" else typ_f,
               None if cat_f=="All" else cat_f, None if cat_f=="All" else cat_f, q or "", q or "", q or ""])
-        inc=sum(float(r[2]) for r in rows if r[4]=="Income"); exp=sum(float(r[2]) for r in rows if r[4]=="Expense")
+        inc=sum(float(r[2]) for r in rows if r[4]=="Income")
+        exp=sum(float(r[2]) for r in rows if r[4]=="Expense" and r[3] not in NON_SPENDING)
+        invd=sum(float(r[2]) for r in rows if r[4]=="Expense" and r[3] in NON_SPENDING)
         st.caption(f"**{len(rows)}** transaction{'s' if len(rows)!=1 else ''}"
-                   f"{' (latest 1000)' if len(rows)==1000 else ''} · in {euro(inc)} · out {euro(exp)} · net {signed_euro(inc-exp)}")
+                   f"{' (latest 1000)' if len(rows)==1000 else ''} · in {euro(inc)} · spent {euro(exp)}"
+                   f"{f' · invested {euro(invd)}' if invd else ''} · saved {signed_euro(inc-exp)}")
         if not rows:
             st.info("No transactions for these filters.")
         else:
@@ -1061,29 +1111,35 @@ elif page=="📊 Reports":
         pstart=date(yr-1, 1, 1); plabel=str(yr-1)
         title=str(yr)
     cur=tx_totals(start, end); prev=tx_totals(pstart, start)
-    k1,k2,k3,k4=st.columns(4)
+    k1,k2,k3,k4,k5=st.columns(5)
     kpi(k1, "💵 Income", cur["income"], cur["income"]-prev["income"], pct_change(cur["income"], prev["income"]),
         f"vs {plabel}", "#16a34a")
-    kpi(k2, "💳 Expenses", cur["expenses"], cur["expenses"]-prev["expenses"], pct_change(cur["expenses"], prev["expenses"]),
-        f"vs {plabel}", "#dc2626", invert=True)
-    kpi(k3, "🔄 Net cash flow", cur["net"], cur["net"]-prev["net"], None, f"vs {plabel}", "#2563eb")
+    kpi(k2, "💳 Spending", cur["expenses"], cur["expenses"]-prev["expenses"], pct_change(cur["expenses"], prev["expenses"]),
+        f"Excludes investing · vs {plabel}", "#dc2626", invert=True)
+    kpi(k3, "📈 Invested", cur["invested"], cur["invested"]-prev["invested"], None,
+        f"{cur['invest_rate']:.0f}% of income" if cur["invest_rate"] is not None else f"vs {plabel}", "#7c3aed")
+    kpi(k4, "🔄 Saved", cur["net"], cur["net"]-prev["net"], None,
+        f"Income − spending · {euro(cur['cash_left'])} kept as cash", "#2563eb")
     rate, prate=cur["rate"], prev["rate"]
-    kpi(k4, "🐷 Savings rate", 0, None if rate is None or prate is None else rate-prate, None,
-        f"{cur['count']} transactions", "#7c3aed",
+    kpi(k5, "🐷 Savings rate", 0, None if rate is None or prate is None else rate-prate, None,
+        f"{cur['count']} transactions", "#0f172a",
         text="—" if rate is None else f"{rate:.1f}%",
         delta_text=None if rate is None or prate is None else f"{rate-prate:+.1f} pp")
     st.write("")
 
     cats=cat_totals(start, end); pcats=cat_totals(pstart, start)
+    cats_all=cat_totals(start, end, include_investing=True)
     t_sp, t_in, t_tr, t_ins=st.tabs(["🧾 Spending", "💵 Income", "📈 Trends", "🔎 Insights"])
 
     with t_sp:
         if not cats:
-            st.info(f"No expenses in {title}.")
+            st.info(f"No spending in {title}.")
         else:
             left, right=st.columns([1.1, 1], gap="large")
             with left:
                 card("By category")
+                if cur["invested"]:
+                    st.caption(f"Spending only. You also invested **{euro(cur['invested'])}** in this period, counted as saving.")
                 items=list(cats.items())[::-1]
                 fig=go.Figure(go.Bar(x=[v for _,v in items], y=[c for c,_ in items], orientation="h",
                                      marker_color=[PIE_COLORS[i % len(PIE_COLORS)] for i in range(len(items))][::-1],
@@ -1109,8 +1165,9 @@ elif page=="📊 Reports":
                 card(f"📆 Spending through the month · {sel:%B} vs {plabel}")
                 def cumulative(s):
                     e=add_months(s, 1); n=(e-s).days
-                    daily={as_date(d): float(v) for d, v in _q("""SELECT transaction_date, SUM(amount) FROM transactions
-                        WHERE transaction_type='Expense' AND transaction_date>=? AND transaction_date<? GROUP BY 1""", [s, e])}
+                    daily={as_date(d): float(v) for d, v in _q(f"""SELECT transaction_date, SUM(amount) FROM transactions
+                        WHERE transaction_type='Expense' AND category NOT IN {_NS_SQL}
+                        AND transaction_date>=? AND transaction_date<? GROUP BY 1""", [s, e])}
                     out, run=[], 0.0
                     for i in range(n):
                         run+=daily.get(s+timedelta(days=i), 0.0); out.append(run)
@@ -1174,37 +1231,38 @@ elif page=="📊 Reports":
         tend=end if mode=="Year" else add_months(sel, 1)
         tstart=start if mode=="Year" else add_months(sel, -11)
         flow=monthly_flow(tstart, tend)
-        x=[m for m,_,_ in flow]
-        card("Income, expenses and net" + (f" · {yr}" if mode=="Year" else " · 12 months to " + f"{sel:%b %Y}"))
-        fig=go.Figure()
-        fig.add_trace(go.Bar(name="Income", x=x, y=[i for _,i,_ in flow], marker_color="#22c55e",
-                             hovertemplate="Income € %{y:,.0f}<extra></extra>"))
-        fig.add_trace(go.Bar(name="Expenses", x=x, y=[e for _,_,e in flow], marker_color="#f87171",
-                             hovertemplate="Expenses € %{y:,.0f}<extra></extra>"))
-        fig.add_trace(go.Scatter(name="Net", x=x, y=[i-e for _,i,e in flow], mode="lines+markers",
-                                 line=dict(color="#0f172a", width=2.5, shape="spline"), hovertemplate="Net € %{y:,.0f}<extra></extra>"))
-        fig.update_layout(barmode="group", hovermode="x unified", bargap=.3)
-        style_chart(fig, 400); fig.update_layout(margin=dict(t=10))
-        fig.update_xaxes(dtick="M1", tickformat="%b\n%Y"); fig.update_yaxes(tickprefix="€ ", separatethousands=True)
-        st.plotly_chart(fig, width="stretch", config=PLOT_CONFIG)
-        card("Savings rate")
-        sr=[(m, (i-e)/i*100) for m, i, e in flow if i]
+        card("Income, spending, investing" + (f" · {yr}" if mode=="Year" else " · 12 months to " + f"{sel:%b %Y}"))
+        st.plotly_chart(flow_chart(flow, 400), width="stretch", config=PLOT_CONFIG)
+        card("Savings rate & investing rate")
+        st.caption("Savings rate = (income − spending) ÷ income. Investing counts as saving, not spending.")
+        sr=[(m, (i-e)/i*100, v/i*100) for m, i, e, v in flow if i]
         if sr:
-            fig=go.Figure(go.Scatter(x=[m for m,_ in sr], y=[v for _,v in sr], mode="lines+markers",
-                                     line=dict(color="#7c3aed", width=3, shape="spline"), fill="tozeroy",
-                                     fillcolor="rgba(124,58,237,.08)", hovertemplate="%{x|%b %Y}: %{y:.1f}%<extra></extra>"))
-            style_chart(fig, 280); fig.update_layout(margin=dict(t=10), showlegend=False)
+            fig=go.Figure()
+            fig.add_trace(go.Scatter(name="Savings rate", x=[m for m,_,_ in sr], y=[v for _,v,_ in sr], mode="lines+markers",
+                                     line=dict(color="#2563eb", width=3, shape="spline"), fill="tozeroy",
+                                     fillcolor="rgba(37,99,235,.08)", hovertemplate="Savings rate %{y:.1f}%<extra></extra>"))
+            fig.add_trace(go.Scatter(name="Invested (% of income)", x=[m for m,_,_ in sr], y=[v for _,_,v in sr],
+                                     mode="lines+markers", line=dict(color="#7c3aed", width=2, dash="dot"),
+                                     hovertemplate="Invested %{y:.1f}%<extra></extra>"))
+            style_chart(fig, 300); fig.update_layout(margin=dict(t=10), hovermode="x unified")
             fig.update_xaxes(dtick="M1", tickformat="%b\n%Y"); fig.update_yaxes(ticksuffix="%")
             st.plotly_chart(fig, width="stretch", config=PLOT_CONFIG)
         else:
             st.caption("No income in this range to calculate a savings rate.")
-        yr_rows=yearly_rows()
+        yr_rows=_q(f"""SELECT EXTRACT(YEAR FROM transaction_date)::INTEGER,
+                   SUM(CASE WHEN transaction_type='Income' THEN amount ELSE 0 END),
+                   SUM(CASE WHEN transaction_type='Expense' AND category NOT IN {_NS_SQL} THEN amount ELSE 0 END),
+                   SUM(CASE WHEN transaction_type='Expense' AND category IN {_NS_SQL} THEN amount ELSE 0 END)
+               FROM transactions GROUP BY 1 ORDER BY 1 DESC""")
         if len(yr_rows)>1:
             card("Year by year")
-            st.dataframe(pd.DataFrame([{"Year": str(y), "Income": float(i or 0), "Expenses": float(e or 0),
-                                        "Net": float(i or 0)-float(e or 0)} for y, i, e in yr_rows][::-1]),
+            st.dataframe(pd.DataFrame([{"Year": str(y), "Income": float(i), "Spending": float(e), "Invested": float(v),
+                                        "Saved": float(i)-float(e),
+                                        "Savings rate": (float(i)-float(e))/float(i)*100 if i else None}
+                                       for y, i, e, v in yr_rows]),
                          hide_index=True, width="stretch",
-                         column_config={k: st.column_config.NumberColumn(format="€ %.2f") for k in ("Income","Expenses","Net")})
+                         column_config={**{k: st.column_config.NumberColumn(format="€ %.2f") for k in ("Income","Spending","Invested","Saved")},
+                                        "Savings rate": st.column_config.NumberColumn(format="%.1f%%")})
 
     with t_ins:
         left, right=st.columns(2, gap="large")
@@ -1213,8 +1271,8 @@ elif page=="📊 Reports":
             st.caption("Needs 30% · Wants 20% · Savings 50% of spending.")
             needs_set={"Housing","Utilities","Groceries","Healthcare","Insurance","Transport","Taxes","Debt"}
             wants_set={"Dining Out","Entertainment","Shopping","Travel","Personal","Subscriptions"}
-            n=sum(v for c,v in cats.items() if c in needs_set); w=sum(v for c,v in cats.items() if c in wants_set)
-            sv=sum(v for c,v in cats.items() if c in {"Savings","Investing"}); oth=sum(cats.values())-n-w-sv
+            n=sum(v for c,v in cats_all.items() if c in needs_set); w=sum(v for c,v in cats_all.items() if c in wants_set)
+            sv=sum(v for c,v in cats_all.items() if c in {"Savings","Investing"}); oth=sum(cats_all.values())-n-w-sv
             tot=n+w+sv+oth
             if tot:
                 labels=["Needs","Wants","Savings/Investing","Other"]; vals=[n,w,sv,oth]; targets=[30,20,50,None]
@@ -1236,14 +1294,15 @@ elif page=="📊 Reports":
                 if get_historical_month_count()<2:
                     st.caption("Needs at least 2 months of history.")
                 else:
-                    an=get_anomalies(sel.year, sel.month)
-                    if not an: st.success("Nothing unusual — every category is within its normal range.")
+                    an=spending_anomalies(sel.year, sel.month)
+                    if an is None: st.caption("Couldn't check for unusual spending right now.")
+                    elif not an: st.success("Nothing unusual — every category is within its normal range.")
                     for c, curv, avg, _ in an:
                         st.warning(f"**{c}**: {euro(curv)} vs your usual {euro(avg)} (+{(float(curv)/float(avg)-1)*100:.0f}%)")
         with right:
             card("🏪 Top merchants")
-            exp_rows=_q("""SELECT description, amount FROM transactions WHERE transaction_type='Expense'
-                           AND transaction_date>=? AND transaction_date<?""", [start, end])
+            exp_rows=_q(f"""SELECT description, amount FROM transactions WHERE transaction_type='Expense'
+                           AND category NOT IN {_NS_SQL} AND transaction_date>=? AND transaction_date<?""", [start, end])
             agg={}
             for d, v in exp_rows:
                 k=merchant_keys(d)[0] or "(no description)"
@@ -1254,8 +1313,8 @@ elif page=="📊 Reports":
                              hide_index=True, width="stretch",
                              column_config={"Total": st.column_config.NumberColumn(format="€ %.2f")})
             card("💸 Biggest expenses")
-            big=_q("""SELECT transaction_date, amount, category, transaction_type, description FROM transactions
-                      WHERE transaction_type='Expense' AND transaction_date>=? AND transaction_date<?
+            big=_q(f"""SELECT transaction_date, amount, category, transaction_type, description FROM transactions
+                      WHERE transaction_type='Expense' AND category NOT IN {_NS_SQL} AND transaction_date>=? AND transaction_date<?
                       ORDER BY amount DESC LIMIT 5""", [start, end])
             st.markdown(tx_rows_html(big), unsafe_allow_html=True)
 # =====================================================================
@@ -1548,14 +1607,16 @@ else:
         types=get_account_types()
         dates_, series_, kinds_=build_series(types)
         p={"today": str(TODAY),
-           "rules": "Cash = every account except the Investments account. Amounts in EUR.",
+           "rules": ("Cash = every account except the Investments account. Amounts in EUR. "
+                     "'expenses' means real spending and EXCLUDES the Investing category; 'invested' is money put into "
+                     "investments and counts as saving. Savings rate = (income - spending) / income."),
            "this_month": tx_totals(MONTH_START, add_months(MONTH_START, 1)),
            "last_month": tx_totals(add_months(MONTH_START, -1), MONTH_START),
            "spend_by_category_last_6_months": [(str(m), c, float(v)) for m, c, v in fetch_all("""
                 SELECT DATE_TRUNC('month',transaction_date)::DATE, category, SUM(amount) FROM transactions
                 WHERE transaction_type='Expense' AND transaction_date>=? GROUP BY 1,2 ORDER BY 1 DESC, 3 DESC""",
                 [add_months(MONTH_START, -5)])],
-           "cashflow_by_month": [(str(m), i, e) for m, i, e in monthly_flow(add_months(MONTH_START, -11), add_months(MONTH_START, 1))],
+           "cashflow_by_month_income_spending_invested": [(str(m), i, e, v) for m, i, e, v in monthly_flow(add_months(MONTH_START, -11), add_months(MONTH_START, 1))],
            "recent_transactions": fetch_all("""SELECT transaction_date,amount,category,transaction_type,description
                 FROM transactions ORDER BY transaction_date DESC,id DESC LIMIT 40"""),
            "recurring": fetch_all("SELECT name,amount,category,frequency,next_due_date,active FROM recurring_expenses"),
