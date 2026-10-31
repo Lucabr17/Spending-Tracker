@@ -422,7 +422,7 @@ def get_gemini_client():
 
 def ask_gemini(question,context):
     client=get_gemini_client()
-    if not client:return "Gemini non è configurato. Imposta GEMINI_API_KEY."
+    if not client:return "Gemini isn't configured yet — add GEMINI_API_KEY to your Streamlit secrets."
     model=get_secret("GEMINI_MODEL") or "gemini-3.6-flash"
     prompt=f"""You are a personal finance assistant. Use ONLY this read-only financial context.
 Do not invent data. Be concise and practical.
@@ -432,8 +432,8 @@ QUESTION:
 {question}"""
     try:
         r=client.models.generate_content(model=model,contents=prompt)
-        return r.text or "Nessuna risposta."
-    except Exception as e:return f"Errore Gemini: {e}"
+        return r.text or "No answer received."
+    except Exception as e:return f"Gemini error: {e}"
 
 def authenticate_user():
     password=get_secret("APP_PASSWORD")

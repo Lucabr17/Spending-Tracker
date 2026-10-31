@@ -212,17 +212,17 @@ def get_anomalies(year,month):
         return []
     return fetch_all("""
         WITH monthly_category AS (
-            SELECT DATE_TRUNC('month',transaction_date) month,category,SUM(amount) spending
+            SELECT DATE_TRUNC('month',transaction_date) AS mth,category,SUM(amount) AS spending
             FROM transactions WHERE transaction_type='Expense' GROUP BY 1,2
         ),
         historical AS (
-            SELECT category,AVG(spending) avg_spend,STDDEV_POP(spending) std_spend
+            SELECT category,AVG(spending) AS avg_spend,STDDEV_POP(spending) AS std_spend
             FROM monthly_category
-            WHERE month<DATE_TRUNC('month',MAKE_DATE(?, ?, 1))
+            WHERE mth<DATE_TRUNC('month',MAKE_DATE(?, ?, 1))
             GROUP BY category
         ),
         current_month AS (
-            SELECT category,SUM(amount) current_spend
+            SELECT category,SUM(amount) AS current_spend
             FROM transactions
             WHERE transaction_type='Expense'
               AND EXTRACT(YEAR FROM transaction_date)=?
