@@ -4,9 +4,11 @@ import json
 import uuid
 from datetime import date, datetime
 
+import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+from plotly.subplots import make_subplots
 
 from db import (
     delete_recurring_expense, delete_transaction,
@@ -20,7 +22,7 @@ try:
     from utils import (
         CATEGORIES, EXPENSE_CATEGORIES, ask_gemini, categories_for,
         extract_image_transactions, get_secret, parse_natural_language,
-        transaction_fingerprint,
+        transaction_fingerprint, auto_categorize, merchant_keys,
     )
 except ImportError:
     from utils import (
@@ -45,14 +47,27 @@ if not st.session_state.get("authenticated") and get_secret("APP_PASSWORD"):
 
 st.markdown("""
 <style>
-.block-container{max-width:1500px;padding-top:1.4rem}
-div[data-testid="stMetric"]{border:1px solid rgba(100,116,139,.20);border-radius:16px;padding:18px;min-height:110px;background:#fff}
-div[data-testid="stMetricValue"]{font-size:1.85rem;font-weight:750}
+.block-container{max-width:1400px;padding-top:1.6rem;padding-bottom:3rem}
+h1{font-weight:800!important;letter-spacing:-.02em}
+h2,h3{font-weight:750!important;letter-spacing:-.01em}
+div[data-testid="stMetric"]{border:1px solid rgba(100,116,139,.18);border-radius:16px;padding:16px 18px;min-height:104px;background:#fff;box-shadow:0 1px 3px rgba(15,23,42,.05)}
+div[data-testid="stMetricValue"]{font-size:1.7rem;font-weight:750}
+div[data-testid="stMetricLabel"] p{font-weight:600;color:#475569}
 .big{font-size:2rem;font-weight:800}
 .card{padding:16px;border-radius:14px;background:white;border:1px solid rgba(100,116,139,.18)}
 .income{border-left:5px solid #16a34a;background:#f0fdf4}
 .expense{border-left:5px solid #dc2626;background:#fef2f2}
 .sub{font-size:.92rem;font-weight:650;margin-top:.35rem}
+.kpi{background:#fff;border:1px solid rgba(100,116,139,.16);border-radius:18px;padding:18px 20px 16px;
+     box-shadow:0 1px 3px rgba(15,23,42,.05);border-top:4px solid var(--accent,#2563eb);height:100%}
+.kpi-label{font-size:.78rem;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:#64748b}
+.kpi-value{font-size:1.9rem;font-weight:800;color:#0f172a;margin-top:6px;line-height:1.15}
+.kpi-delta{font-size:.92rem;font-weight:650;margin-top:6px}
+.kpi-sub{font-size:.8rem;color:#94a3b8;margin-top:2px}
+.pill{display:inline-block;padding:2px 10px;border-radius:999px;font-size:.78rem;font-weight:650;background:#eff6ff;color:#1d4ed8}
+button[data-baseweb="tab"] p{font-size:1rem;font-weight:650}
+div[data-testid="stDataFrame"],div[data-testid="stDataEditor"]{border-radius:12px}
+div[data-testid="stExpander"] details{border-radius:14px;background:#fff}
 </style>
 """,unsafe_allow_html=True)
 
@@ -88,23 +103,62 @@ def style_chart(fig, height=480):
     fig.update_yaxes(gridcolor="rgba(148,163,184,.28)", zeroline=False, automargin=True, title_standoff=12)
     return fig
 
-def new_line(name="", amount=0.0):
-    return {"uid": uuid.uuid4().hex[:8], "name": name, "amount": float(amount or 0)}
+@st.cache_data(ttl=600, show_spinner=False)
+def _q(sql, params=None):
+    """Cached read for the Wealth page. Cleared whenever a snapshot changes."""
+    return fetch_all(sql, params)
+
+def bust_cache():
+    _q.clear()
+
+ACCOUNT_KINDS=["Cash","Investment"]
+INVEST_KEYS=("invest","etf","broker","azioni","trading 212","trading212","t212","mexem",
+             "degiro","scalable","trade republic","ibkr","interactive brokers","directa",
+             "stock","shares","crypto","fondo","fund","pension","super","bitcoin")
+CASH_COLORS=["#1d4ed8","#3b82f6","#60a5fa","#93c5fd","#0e7490","#06b6d4","#67e8f9","#bfdbfe","#1e3a8a","#0284c7"]
+INV_COLORS=["#ea580c","#f97316","#fb923c","#fdba74","#c2410c","#f59e0b","#fbbf24","#fed7aa","#9a3412","#d97706"]
+
+def guess_kind(name):
+    n=(name or "").lower()
+    return "Investment" if any(k in n for k in INVEST_KEYS) else "Cash"
+
+def get_account_types():
+    ensure_net_worth_items()
+    return {str(r[0]).strip().lower(): r[1] for r in _q("SELECT name, kind FROM account_types")}
+
+def kind_of(name, types):
+    return types.get((name or "").strip().lower()) or guess_kind(name)
+
+def save_account_types(items):
+    for it in items:
+        if it["kind"]=="Asset":
+            execute("INSERT INTO account_types(name,kind) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET kind=excluded.kind",
+                    [it["name"].strip().lower(), it.get("group") or guess_kind(it["name"])])
+
+def new_line(name="", amount=0.0, group=None):
+    return {"uid": uuid.uuid4().hex[:8], "name": name, "amount": float(amount or 0),
+            "group": group or guess_kind(name)}
 
 def clear_prefix(prefix):
     for key in list(st.session_state.keys()):
         if str(key).startswith(prefix):
             del st.session_state[key]
 
-def edit_lines(rows, prefix):
+def edit_lines(rows, prefix, with_type=False):
     remove_uid=None
     for i, row in enumerate(rows):
-        nk, ak=f"{prefix}n{row['uid']}", f"{prefix}a{row['uid']}"
-        c1,c2,c3=st.columns([3,2,.8])
+        nk, ak, tk=f"{prefix}n{row['uid']}", f"{prefix}a{row['uid']}", f"{prefix}t{row['uid']}"
+        if with_type:
+            c1,ct,c2,c3=st.columns([3,1.6,2,.8])
+        else:
+            c1,c2,c3=st.columns([3,2,.8]); ct=None
         vis="visible" if i==0 else "collapsed"
         if nk not in st.session_state: st.session_state[nk]=row["name"]
         if ak not in st.session_state: st.session_state[ak]=float(row["amount"])
         row["name"]=c1.text_input("Name", key=nk, label_visibility=vis)
+        if with_type:
+            if tk not in st.session_state: st.session_state[tk]=row.get("group") or guess_kind(row["name"])
+            row["group"]=ct.selectbox("Type", ACCOUNT_KINDS, key=tk, label_visibility=vis)
         row["amount"]=float(c2.number_input("Amount", min_value=0., step=100., key=ak, label_visibility=vis))
         if i==0: c3.markdown("<div style='height:1.7rem'></div>", unsafe_allow_html=True)
         if c3.button("Remove", key=f"{prefix}r{row['uid']}"): remove_uid=row["uid"]
@@ -120,7 +174,8 @@ def collect_lines(rows, kind):
         if amount>0 and not name:
             return None
         if name and amount>0:
-            items.append({"kind": kind, "name": name, "amount": amount})
+            items.append({"kind": kind, "name": name, "amount": amount,
+                          "group": row.get("group") or guess_kind(name)})
     return items
 
 def merge_items(items):
@@ -135,6 +190,23 @@ def merge_items(items):
     return merged
 
 def ensure_net_worth_items():
+    # Runs the setup once per server process instead of on every query (much faster on MotherDuck).
+    _net_worth_setup()
+
+@st.cache_resource
+def _net_worth_setup():
+    execute("""
+        CREATE TABLE IF NOT EXISTS account_types (
+            name VARCHAR PRIMARY KEY,
+            kind VARCHAR NOT NULL CHECK(kind IN ('Cash','Investment'))
+        )
+    """)
+    execute("""
+        CREATE TABLE IF NOT EXISTS category_rules (
+            merchant VARCHAR PRIMARY KEY,
+            category VARCHAR NOT NULL
+        )
+    """)
     execute("CREATE SEQUENCE IF NOT EXISTS net_worth_items_id_seq START 1")
     execute("""
         CREATE TABLE IF NOT EXISTS net_worth_items (
@@ -165,16 +237,16 @@ def ensure_net_worth_items():
                 inserted+=1
         if inserted==0:
             execute("INSERT INTO net_worth_items(snapshot_id,kind,name,amount) VALUES (?,?,?,?)",[row[0],"Asset","Cash",0])
+    return True
 
 def _rollup(items):
+    # Every asset that is not an investment counts as cash.
     cash=inv=real=other=loans=cards=oliab=0.0
     for it in items:
         name=it["name"].strip().lower(); amt=float(it["amount"])
         if it["kind"]=="Asset":
-            if name in {"cash","contanti","checking"}: cash+=amt
-            elif any(k in name for k in ("invest","etf","broker","azioni")): inv+=amt
-            elif any(k in name for k in ("real estate","immobil","house","casa")): real+=amt
-            else: other+=amt
+            if (it.get("group") or guess_kind(name))=="Investment": inv+=amt
+            else: cash+=amt
         else:
             if "student" in name or "studio" in name: loans+=amt
             elif "credit" in name or "carta" in name: cards+=amt
@@ -190,13 +262,15 @@ def _insert_items(snapshot_id, items):
 def save_snapshot(snapshot_date, items):
     ensure_net_worth_items()
     cash,inv,real,other,loans,cards,oliab=_rollup(items)
-    execute("""
+    sid=execute("""
         INSERT INTO net_worth
         (snapshot_date,cash,investments,real_estate,other_assets,student_loans,credit_card_debt,other_liabilities)
         VALUES (?,?,?,?,?,?,?,?)
-    """,[snapshot_date,cash,inv,real,other,loans,cards,oliab])
-    sid=fetch_one("SELECT id FROM net_worth ORDER BY id DESC LIMIT 1")[0]
+        RETURNING id
+    """,[snapshot_date,cash,inv,real,other,loans,cards,oliab]).fetchone()[0]
     _insert_items(sid, items)
+    save_account_types(items)
+    bust_cache()
 
 def replace_snapshot(snapshot_id, snapshot_date, items):
     ensure_net_worth_items()
@@ -209,15 +283,34 @@ def replace_snapshot(snapshot_id, snapshot_date, items):
     """,[snapshot_date,cash,inv,real,other,loans,cards,oliab,snapshot_id])
     execute("DELETE FROM net_worth_items WHERE snapshot_id=?",[snapshot_id])
     _insert_items(snapshot_id, items)
+    save_account_types(items)
+    bust_cache()
+
+def lines_from_snapshot(snapshot_id, types):
+    items=get_snapshot_items(snapshot_id)
+    assets=[new_line(n, a, kind_of(n, types)) for k,n,a in items if k=="Asset" and str(n).strip()]
+    liabs=[new_line(n, a) for k,n,a in items if k=="Liability"]
+    assets.sort(key=lambda r: r["group"]!="Cash")   # cash accounts first, investments after
+    return assets, liabs
+
+def default_lines():
+    """Accounts (and last balances) from the most recent snapshot, so you don't retype them."""
+    latest=(_q("SELECT id, snapshot_date FROM net_worth ORDER BY snapshot_date DESC, id DESC LIMIT 1") or [None])[0]
+    if latest:
+        assets, liabs=lines_from_snapshot(latest[0], get_account_types())
+        if assets:
+            return assets, liabs, as_date(latest[1])
+    return [new_line("Cash"), new_line("Investments", 0, "Investment")], [], None
 
 def remove_snapshot(snapshot_id):
     ensure_net_worth_items()
     execute("DELETE FROM net_worth_items WHERE snapshot_id=?",[snapshot_id])
     execute("DELETE FROM net_worth WHERE id=?",[snapshot_id])
+    bust_cache()
 
 def get_snapshot_items(snapshot_id):
     ensure_net_worth_items()
-    return fetch_all("""
+    return _q("""
         SELECT kind,name,amount FROM net_worth_items
         WHERE snapshot_id=?
         ORDER BY CASE kind WHEN 'Asset' THEN 0 ELSE 1 END, id
@@ -225,7 +318,7 @@ def get_snapshot_items(snapshot_id):
 
 def get_asset_history():
     ensure_net_worth_items()
-    return fetch_all("""
+    return _q("""
         SELECT n.snapshot_date,i.name,SUM(i.amount)
         FROM net_worth_items i JOIN net_worth n ON n.id=i.snapshot_id
         WHERE i.kind='Asset'
@@ -235,7 +328,7 @@ def get_asset_history():
 
 def get_net_worth_history():
     ensure_net_worth_items()
-    return fetch_all("""
+    return _q("""
         SELECT n.snapshot_date,
           COALESCE((SELECT SUM(CASE WHEN i.kind='Asset' THEN i.amount ELSE -i.amount END)
                     FROM net_worth_items i WHERE i.snapshot_id=n.id),
@@ -246,7 +339,7 @@ def get_net_worth_history():
 
 def get_net_worth_records():
     ensure_net_worth_items()
-    return fetch_all("""
+    return _q("""
         SELECT n.id,n.snapshot_date,
           COALESCE((SELECT SUM(amount) FROM net_worth_items i WHERE i.snapshot_id=n.id AND i.kind='Asset'),
                    n.cash+n.investments+n.real_estate+n.other_assets),
@@ -258,6 +351,113 @@ def get_net_worth_records():
                    -COALESCE(n.student_loans,0)-COALESCE(n.credit_card_debt,0)-COALESCE(n.other_liabilities,0))
         FROM net_worth n ORDER BY n.snapshot_date DESC,n.id DESC
     """)
+
+# ---------------------------------------------------------------------
+# Wealth page building blocks
+# ---------------------------------------------------------------------
+PLOT_CONFIG={"displayModeBar": False}
+
+def signed_euro(v):
+    v=float(v)
+    return ("+" if v>0 else "−" if v<0 else "")+euro(abs(v))
+
+def pct_change(cur, prev):
+    return None if not prev else (float(cur)-float(prev))/abs(float(prev))*100
+
+def kpi(col, label, value, delta=None, pct=None, sub=None, accent="#2563eb"):
+    d=""
+    if delta is not None:
+        color="#16a34a" if delta>0 else "#dc2626" if delta<0 else "#64748b"
+        arrow="▲" if delta>0 else "▼" if delta<0 else "■"
+        p=f" · {pct:+.1f}%" if pct is not None else ""
+        d=f'<div class="kpi-delta" style="color:{color}">{arrow} {signed_euro(delta)}{p}</div>'
+    s=f'<div class="kpi-sub">{sub}</div>' if sub else ""
+    col.markdown(f'<div class="kpi" style="--accent:{accent}"><div class="kpi-label">{label}</div>'
+                 f'<div class="kpi-value">{euro(value)}</div>{d}{s}</div>', unsafe_allow_html=True)
+
+def lines_df(lines, with_type):
+    if with_type:
+        return pd.DataFrame([{"Account": r["name"], "Type": r["group"], "Amount": float(r["amount"])} for r in lines],
+                            columns=["Account","Type","Amount"])
+    return pd.DataFrame([{"Account": r["name"], "Amount": float(r["amount"])} for r in lines], columns=["Account","Amount"])
+
+def lines_editor(df, key, with_type):
+    cfg={"Account": st.column_config.TextColumn("Account", width="medium"),
+         "Amount": st.column_config.NumberColumn("Amount (€)", min_value=0.0, step=0.01, format="€ %.2f")}
+    if with_type:
+        cfg["Type"]=st.column_config.SelectboxColumn("Type", options=ACCOUNT_KINDS, width="small",
+                                                     help="Leave empty on a new row and it is detected from the name")
+    return st.data_editor(df, key=key, num_rows="dynamic", hide_index=True, width="stretch", column_config=cfg)
+
+def _clean(v):
+    return None if v is None or (isinstance(v, float) and pd.isna(v)) or (not isinstance(v, str) and pd.isna(v)) else v
+
+def items_from_df(df, kind):
+    """Rows -> items. Returns None when an amount has no account name."""
+    items=[]
+    for r in df.to_dict("records"):
+        name=str(_clean(r.get("Account")) or "").strip()
+        amount=float(_clean(r.get("Amount")) or 0)
+        if amount>0 and not name:
+            return None
+        if name and amount>0:
+            group=_clean(r.get("Type")) if kind=="Asset" else None
+            items.append({"kind": kind, "name": name, "amount": amount, "group": group or guess_kind(name)})
+    return items
+
+def build_series(types):
+    """dates (sorted), {account: {date: amount}}, {account: kind}"""
+    dates, series=[], {}
+    for dt, name, amt in get_asset_history():
+        dt=as_date(dt)
+        if dt not in dates: dates.append(dt)
+        series.setdefault(name, {})[dt]=float(amt or 0)
+    dates.sort()
+    return dates, series, {n: kind_of(n, types) for n in series}
+
+def group_values(dates, series, kinds, kind):
+    return {dt: sum(v.get(dt, 0) for n, v in series.items() if kinds[n]==kind) for dt in dates}
+
+def networth_values():
+    out={}
+    for dt, v in get_net_worth_history():
+        out[as_date(dt)]=float(v or 0)
+    return out
+
+def monthly_series(values):
+    """Last snapshot of each month, with change vs the previous month in € and %."""
+    by_month={}
+    for dt in sorted(values):
+        by_month[(dt.year, dt.month)]=(dt, float(values[dt]))
+    rows, prev=[], None
+    for (y, m), (dt, v) in sorted(by_month.items()):
+        ch=None if prev is None else v-prev
+        rows.append({"month": date(y, m, 1), "snapshot": dt, "value": v, "change": ch,
+                     "pct": None if prev is None else pct_change(v, prev)})
+        prev=v
+    return rows
+
+def learn_category(description, category):
+    """Remember the category you chose for this merchant."""
+    if category in (None, "", "Other", "Other Income"):
+        return
+    ensure_net_worth_items()
+    for key in merchant_keys(description):
+        if key:
+            execute("INSERT INTO category_rules(merchant,category) VALUES(?,?) "
+                    "ON CONFLICT(merchant) DO UPDATE SET category=excluded.category", [key, category])
+
+def smart_category(description, transaction_type, suggested):
+    """Your past choice for this exact merchant > a specific keyword/AI match > your choice for the brand > guess."""
+    ensure_net_worth_items()
+    valid=categories_for(transaction_type)
+    full, first=merchant_keys(description)
+    rules={k: c for k, c in fetch_all("SELECT merchant, category FROM category_rules WHERE merchant IN (?, ?)",
+                                     [full or "", first or ""]) if c in valid}
+    if full in rules: return rules[full], "learned"
+    if suggested in valid and suggested not in ("Other", "Other Income"): return suggested, "auto"
+    if first in rules: return rules[first], "learned"
+    return (suggested if suggested in valid else valid[0]), "auto"
 
 PIE_COLORS=["#16a34a","#2563eb","#0891b2","#d97706","#dc2626","#7c3aed","#0f766e","#db2777","#64748b","#ca8a04"]
 
@@ -342,14 +542,14 @@ if page=="🏠 Dashboard":
     fig.add_trace(go.Bar(x=[month_name(x[0]) for x in r],y=[float(x[1]) for x in r],name="Income",marker_color=INCOME_COLOR))
     fig.add_trace(go.Bar(x=[month_name(x[0]) for x in r],y=[float(x[2]) for x in r],name="Expenses",marker_color=EXPENSE_COLOR))
     fig.update_layout(barmode="group",title=f"Monthly Income vs Expenses — {y}",yaxis_title="€")
-    st.plotly_chart(style_chart(fig,500),use_container_width=True)
+    st.plotly_chart(style_chart(fig,500),width="stretch")
     yr=yearly_rows()
     if yr:
         yf=go.Figure()
         yf.add_trace(go.Bar(x=[str(x[0]) for x in yr],y=[float(x[1]) for x in yr],name="Income",marker_color=INCOME_COLOR))
         yf.add_trace(go.Bar(x=[str(x[0]) for x in yr],y=[float(x[2]) for x in yr],name="Expenses",marker_color=EXPENSE_COLOR))
         yf.update_layout(barmode="group",title="Overall Yearly Income vs Expenses",yaxis_title="€")
-        st.plotly_chart(style_chart(yf,450),use_container_width=True)
+        st.plotly_chart(style_chart(yf,450),width="stretch")
 
 # =====================================================================
 # DATA ENTRY
@@ -410,7 +610,7 @@ elif page=="📝 Data Entry":
             a=c2.number_input("Amount", min_value=0.01, step=0.01)
             cat=st.selectbox("Category", cats, key="manual_cat")
             desc=st.text_input("Description", placeholder="Esselunga")
-            if st.form_submit_button("Save", use_container_width=True):
+            if st.form_submit_button("Save", width="stretch"):
                 fp=transaction_fingerprint(d,a,cat,typ,desc)
                 if insert_transaction(d,a,cat,typ,desc,"manual",fp):
                     st.toast("Salvata")
@@ -418,46 +618,76 @@ elif page=="📝 Data Entry":
                     st.toast("Transazione duplicata")
 
     with tab_import:
-        st.subheader("Receipt or bank screenshot")
-        st.caption("Upload a photo or a screenshot. PDF statements are no longer imported.")
-        imgf=st.file_uploader("Upload receipt or bank/card screenshot", type=["png","jpg","jpeg","webp"], key="img_upload")
+        st.subheader("📸 Bank or receipt screenshot")
+        st.caption("Upload a screenshot from your banking app or a photo of a receipt. Every transaction is read and "
+                   "categorised automatically. Fix anything that's wrong before importing — the app remembers your "
+                   "choice for that merchant next time.")
+        imgf=st.file_uploader("Upload screenshot", type=["png","jpg","jpeg","webp"], key="img_upload",
+                              label_visibility="collapsed")
         if imgf:
             from PIL import Image
             im=Image.open(imgf).convert("RGB")
-            st.image(im, width=550)
-            if st.button("Scan image", type="primary", key="scan_img"):
-                rows, raw=extract_image_transactions(im)
-                st.session_state.ocr_rows=rows
-                st.session_state.ocr_raw=raw
-                if rows:
-                    st.toast(f"{len(rows)} transaction(s) found")
-                else:
-                    st.warning("Nessuna transazione riconosciuta. Lo scanner usa RapidOCR e, se configurato, Gemini Vision. Puoi inserirla da Quick add.")
+            c_img, c_btn=st.columns([1, 1])
+            c_img.image(im, width="stretch")
+            with c_btn:
+                if not get_secret("GEMINI_API_KEY"):
+                    st.info("Tip: add a GEMINI_API_KEY secret for much better reading and categorisation of bank screenshots.")
+                if st.button("🔍 Scan screenshot", type="primary", key="scan_img", width="stretch"):
+                    with st.spinner("Reading transactions…"):
+                        rows, raw=extract_image_transactions(im)
+                        for r in rows:
+                            r["category"], r["how"]=smart_category(r["description"], r["transaction_type"], r.get("category"))
+                    st.session_state.ocr_rows=rows
+                    st.session_state.ocr_raw=raw
+                    st.session_state.ocr_ver=st.session_state.get("ocr_ver", 0)+1
+                    if rows:
+                        st.toast(f"{len(rows)} transaction(s) found")
+                    else:
+                        st.warning("No transactions recognised. Try a sharper screenshot, or add it from Quick add.")
         if st.session_state.get("ocr_rows"):
-            st.subheader("Review")
-            cleaned=[]
-            for i,x in enumerate(st.session_state.ocr_rows):
-                c1,c2,c3,c4=st.columns(4)
-                d=c1.date_input("Date", x["transaction_date"], key=f"ocr_d_{i}")
-                amount=c2.number_input("Amount", min_value=0.01, value=float(x["amount"]), step=0.01, key=f"ocr_a_{i}")
-                typ=c3.selectbox("Type", ["Expense","Income"], index=0 if x.get("transaction_type")=="Expense" else 1, key=f"ocr_t_{i}")
-                desc=c4.text_input("Description", x.get("description","Image OCR"), key=f"ocr_x_{i}")
-                cats=categories_for(typ)
-                ck=f"ocr_c_{i}"
-                if ck not in st.session_state:
-                    st.session_state[ck]=x.get("category") if x.get("category") in cats else cats[0]
-                elif st.session_state[ck] not in cats:
-                    st.session_state[ck]=cats[0]
-                cat=st.selectbox("Category", cats, key=ck)
-                cleaned.append((d,amount,cat,typ,desc))
-            if st.button("Import scanned transactions", type="primary", key="import_ocr"):
+            st.subheader("Review & import")
+            rows=st.session_state.ocr_rows
+            df=pd.DataFrame([{
+                "Import": True,
+                "Date": x["transaction_date"],
+                "Description": x.get("description") or "Bank/card transaction",
+                "Amount": float(x["amount"]),
+                "Type": x.get("transaction_type") or "Expense",
+                "Category": x.get("category") or "Other",
+                "": "🧠 learned" if x.get("how")=="learned" else "",
+            } for x in rows])
+            edited=st.data_editor(
+                df, key=f"ocr_editor_{st.session_state.get('ocr_ver', 0)}", hide_index=True, width="stretch",
+                num_rows="fixed", disabled=[""],
+                column_config={
+                    "Import": st.column_config.CheckboxColumn(width="small"),
+                    "Date": st.column_config.DateColumn(format="DD/MM/YYYY", width="small"),
+                    "Description": st.column_config.TextColumn(width="large"),
+                    "Amount": st.column_config.NumberColumn(min_value=0.01, step=0.01, format="€ %.2f", width="small"),
+                    "Type": st.column_config.SelectboxColumn(options=["Expense", "Income"], width="small"),
+                    "Category": st.column_config.SelectboxColumn(options=CATEGORIES, width="medium"),
+                    "": st.column_config.TextColumn(width="small"),
+                })
+            chosen=edited[edited["Import"]==True]
+            exp_total=chosen.loc[chosen["Type"]=="Expense","Amount"].sum()
+            inc_total=chosen.loc[chosen["Type"]=="Income","Amount"].sum()
+            st.caption(f"{len(chosen)} selected · expenses {euro(exp_total)} · income {euro(inc_total)}")
+            b1, b2=st.columns([3, 1])
+            if b1.button("✅ Import selected", type="primary", key="import_ocr", width="stretch"):
                 ins=dup=0
-                for d,amount,cat,typ,desc in cleaned:
-                    fp=transaction_fingerprint(d,amount,cat,typ,desc)
-                    if insert_transaction(d,amount,cat,typ,desc,"image_ocr",fp): ins+=1
+                for r in chosen.to_dict("records"):
+                    d=as_date(r["Date"]); amount=float(r["Amount"]); typ=r["Type"] or "Expense"
+                    desc=str(r["Description"] or "").strip()
+                    cat=r["Category"] if r["Category"] in categories_for(typ) else auto_categorize(desc, typ)
+                    fp=transaction_fingerprint(d, amount, cat, typ, desc)
+                    if insert_transaction(d, amount, cat, typ, desc, "image_ocr", fp): ins+=1
                     else: dup+=1
+                    learn_category(desc, cat)
                 st.session_state.ocr_rows=[]
-                st.toast(f"Inserite {ins}. Duplicate ignorate {dup}.")
+                st.toast(f"Imported {ins}" + (f" · skipped {dup} duplicate(s)" if dup else "") + " ✅")
+                st.rerun()
+            if b2.button("Discard", key="discard_ocr", width="stretch"):
+                st.session_state.ocr_rows=[]
                 st.rerun()
 
     with tab_rec:
@@ -525,7 +755,7 @@ elif page=="📝 Data Entry":
                 "Type": r[4],
                 "Description": r[5] or "",
                 "Source": r[6] or "",
-            } for r in rows], use_container_width=True, hide_index=True)
+            } for r in rows], width="stretch", hide_index=True)
             labels={r[0]: f"{as_date(r[1]):%d/%m/%Y} · {euro(r[2])} · {r[3]} · {r[5] or '—'}" for r in rows}
             ids=[r[0] for r in rows]
             if st.session_state.get("tx_edit_id") not in ids:
@@ -552,6 +782,8 @@ elif page=="📝 Data Entry":
             b1,b2=st.columns(2)
             if b1.button("Save changes", key="tx_save"):
                 update_transaction(rid, nd, na, nc, nt, nx)
+                if nc!=row[3]:
+                    learn_category(nx, nc)
                 st.session_state.tx_loaded=None
                 st.toast("Aggiornata")
                 st.rerun()
@@ -576,8 +808,8 @@ elif page=="📊 Reports":
         c1,c2=st.columns(2); c1.markdown(f'<div class="card income"><b>💵 TOTAL INCOME</b><div class="big">{euro(s["income"])}</div></div>',unsafe_allow_html=True); c2.markdown(f'<div class="card expense"><b>💳 TOTAL EXPENSES</b><div class="big">{euro(s["expenses"])}</div></div>',unsafe_allow_html=True)
         c1,c2,c3=st.columns(3); c1.metric("Wage",euro(w)); c2.metric("Other Income",euro(o)); c3.metric("Net Cash Flow",euro(s["cash_flow"]))
         st.divider(); st.header("🥧 Income & Spending"); cats=get_category_spending(y,m); p1,p2=st.columns(2)
-        if w+o>0: p1.plotly_chart(px.pie(names=["Wage","Other Income"],values=[w,o],hole=.5,color_discrete_sequence=PIE_COLORS,title="Income split"),use_container_width=True)
-        if cats: p2.plotly_chart(px.pie(names=[x[0] for x in cats],values=[float(x[1]) for x in cats],hole=.5,color_discrete_sequence=PIE_COLORS,title="Spending by category"),use_container_width=True)
+        if w+o>0: p1.plotly_chart(px.pie(names=["Wage","Other Income"],values=[w,o],hole=.5,color_discrete_sequence=PIE_COLORS,title="Income split"),width="stretch")
+        if cats: p2.plotly_chart(px.pie(names=[x[0] for x in cats],values=[float(x[1]) for x in cats],hole=.5,color_discrete_sequence=PIE_COLORS,title="Spending by category"),width="stretch")
         st.divider(); st.header("💳 Spending by Category")
         if cats:
             cols=st.columns(3)
@@ -588,10 +820,10 @@ elif page=="📊 Reports":
         wage=float(fetch_one("SELECT COALESCE(SUM(amount),0) FROM transactions WHERE transaction_type='Income' AND EXTRACT(YEAR FROM transaction_date)=? AND (category='Wage' OR lower(coalesce(description,'')) LIKE '%salary%' OR lower(coalesce(description,'')) LIKE '%stipendio%' OR lower(coalesce(description,'')) LIKE '%wage%' OR lower(coalesce(description,'')) LIKE '%payroll%')",[y])[0] or 0); other=inc-wage
         st.subheader(f"Financial overview — {y}"); c1,c2=st.columns(2); c1.markdown(f'<div class="card income"><b>💵 TOTAL INCOME</b><div class="big">{euro(inc)}</div></div>',unsafe_allow_html=True); c2.markdown(f'<div class="card expense"><b>💳 TOTAL EXPENSES</b><div class="big">{euro(exp)}</div></div>',unsafe_allow_html=True)
         c1,c2,c3=st.columns(3); c1.metric("Wage",euro(wage)); c2.metric("Other Income",euro(other)); c3.metric("Net Cash Flow",euro(inc-exp))
-        monthly=monthly_rows(y); fig=go.Figure(); fig.add_trace(go.Bar(x=[month_name(x[0]) for x in monthly],y=[float(x[1]) for x in monthly],name="Income",marker_color="#16a34a")); fig.add_trace(go.Bar(x=[month_name(x[0]) for x in monthly],y=[float(x[2]) for x in monthly],name="Expenses",marker_color="#dc2626")); fig.update_layout(barmode="group",title=f"Monthly overview — {y}",yaxis_title="€"); st.plotly_chart(style_chart(fig,430),use_container_width=True)
+        monthly=monthly_rows(y); fig=go.Figure(); fig.add_trace(go.Bar(x=[month_name(x[0]) for x in monthly],y=[float(x[1]) for x in monthly],name="Income",marker_color="#16a34a")); fig.add_trace(go.Bar(x=[month_name(x[0]) for x in monthly],y=[float(x[2]) for x in monthly],name="Expenses",marker_color="#dc2626")); fig.update_layout(barmode="group",title=f"Monthly overview — {y}",yaxis_title="€"); st.plotly_chart(style_chart(fig,430),width="stretch")
         st.divider(); st.header("🥧 Yearly Spending & Income"); cats=fetch_all("SELECT category,SUM(amount) FROM transactions WHERE transaction_type='Expense' AND EXTRACT(YEAR FROM transaction_date)=? GROUP BY category ORDER BY 2 DESC",[y]); p1,p2=st.columns(2)
-        if inc>0: p1.plotly_chart(px.pie(names=["Wage","Other Income"],values=[wage,other],hole=.5,color_discrete_sequence=PIE_COLORS,title="Income split"),use_container_width=True)
-        if cats: p2.plotly_chart(px.pie(names=[x[0] for x in cats],values=[float(x[1]) for x in cats],hole=.5,color_discrete_sequence=PIE_COLORS,title="Spending by category"),use_container_width=True)
+        if inc>0: p1.plotly_chart(px.pie(names=["Wage","Other Income"],values=[wage,other],hole=.5,color_discrete_sequence=PIE_COLORS,title="Income split"),width="stretch")
+        if cats: p2.plotly_chart(px.pie(names=[x[0] for x in cats],values=[float(x[1]) for x in cats],hole=.5,color_discrete_sequence=PIE_COLORS,title="Spending by category"),width="stretch")
         st.divider(); st.header("💳 Annual Spending by Category")
         if cats:
             cols=st.columns(3)
@@ -620,141 +852,276 @@ elif page=="📊 Reports":
 # WEALTH
 # =====================================================================
 elif page=="💎 Wealth & Strategy":
-    st.title("💎 Wealth Building & Strategy")
-    st.header("1. Add a snapshot")
-    st.caption("One line per account. Rename Cash, add another bank, or remove what you don't use. A car or a house can be added the same way later.")
-    if st.session_state.pop("nw_reset_new", False):
-        clear_prefix("nwnewa")
-        clear_prefix("nwnewl")
-        st.session_state.nw_new_assets=[new_line("Cash"), new_line("Investments")]
-        st.session_state.nw_new_liab=[]
-    if "nw_new_assets" not in st.session_state:
-        st.session_state.nw_new_assets=[new_line("Cash"), new_line("Investments")]
-    if "nw_new_liab" not in st.session_state:
-        st.session_state.nw_new_liab=[]
-    d=st.date_input("Snapshot date", date.today(), key="nw_new_date")
-    st.subheader("Assets")
-    edit_lines(st.session_state.nw_new_assets, "nwnewa")
-    if st.button("Add asset", key="nw_add_asset"):
-        st.session_state.nw_new_assets.append(new_line())
-        st.rerun()
-    st.subheader("Liabilities")
-    st.caption("Leave this empty if you have none.")
-    edit_lines(st.session_state.nw_new_liab, "nwnewl")
-    if st.button("Add liability", key="nw_add_liab"):
-        st.session_state.nw_new_liab.append(new_line())
-        st.rerun()
-    if st.button("Save snapshot", type="primary", key="nw_save_new"):
-        assets=collect_lines(st.session_state.nw_new_assets, "Asset")
-        liabs=collect_lines(st.session_state.nw_new_liab, "Liability")
-        if assets is None or liabs is None:
-            st.error("Give every amount a name.")
-        else:
-            items=merge_items(assets+liabs)
-            if not items:
-                st.warning("Enter at least one amount.")
-            else:
-                save_snapshot(d, items)
-                st.session_state.nw_reset_new=True
-                st.toast("Snapshot salvato")
-                st.rerun()
+    st.title("💎 Wealth")
+    types=get_account_types()
     records=get_net_worth_records()
-    if not records:
-        st.info("No snapshots yet. Save the first one above and it will show up here.")
-    else:
-        latest=records[0]
-        delta=None
-        help_txt=None
-        if len(records)>1:
-            delta=round(float(latest[4])-float(records[1][4]), 2)
-            help_txt=f"Versus {as_date(records[1][1]):%d/%m/%Y}"
-        st.metric("Latest net worth", euro(latest[4]), delta=delta, help=help_txt)
-        st.header("2. Growth")
-        fig=go.Figure()
-        dates, series=[], {}
-        for dt, name, amt in get_asset_history():
-            if dt not in dates: dates.append(dt)
-            series.setdefault(name, {})[dt]=float(amt or 0)
-        for name in sorted(series):
-            fig.add_trace(go.Bar(name=name, x=dates, y=[series[name].get(dt, 0) for dt in dates]))
-        hist=get_net_worth_history()
-        if hist:
-            fig.add_trace(go.Scatter(name="Net worth", x=[r[0] for r in hist], y=[float(r[1]) for r in hist], mode="lines+markers", line=dict(color="#0f172a", width=3)))
-        fig.update_layout(barmode="stack", title="Assets and net worth", yaxis_title="€")
-        st.plotly_chart(style_chart(fig, 520), use_container_width=True)
-        st.dataframe([{
-            "Date": as_date(r[1]).strftime("%d/%m/%Y"),
-            "Assets": float(r[2] or 0),
-            "Liabilities": float(r[3] or 0),
-            "Net worth": float(r[4] or 0),
-        } for r in records], use_container_width=True, hide_index=True)
-        st.divider()
-        st.header("3. Correct a snapshot")
-        st.caption("Pick one snapshot. Add, rename, or remove lines, then save. This stays one form, not a long list.")
-        ids=[r[0] for r in records]
-        labels={r[0]: f"{as_date(r[1]):%d/%m/%Y} · {euro(r[4])}" for r in records}
-        if st.session_state.get("nw_pick") not in ids:
-            st.session_state.nw_pick=ids[0]
-        pick=st.selectbox("Snapshot", ids, format_func=lambda i: labels[i], key="nw_pick")
-        chosen=next(r for r in records if r[0]==pick)
-        if st.session_state.get("nw_edit_id")!=pick:
-            clear_prefix("nwedita")
-            clear_prefix("nweditl")
-            if "nweditd" in st.session_state:
-                del st.session_state["nweditd"]
-            items=get_snapshot_items(pick)
-            assets=[new_line(n, a) for k,n,a in items if k=="Asset"]
-            liabs=[new_line(n, a) for k,n,a in items if k=="Liability"]
-            if not assets:
-                assets=[new_line("Cash"), new_line("Investments")]
-            st.session_state.nw_edit_assets=[x for x in assets]
-            st.session_state.nw_edit_liab=[x for x in liabs]
-            st.session_state.nweditd=as_date(chosen[1])
-            st.session_state.nw_edit_id=pick
-        nd=st.date_input("Snapshot date", key="nweditd")
-        st.subheader("Assets")
-        edit_lines(st.session_state.nw_edit_assets, "nwedita")
-        if st.button("Add asset", key="nw_edit_add_asset"):
-            st.session_state.nw_edit_assets.append(new_line())
-            st.rerun()
-        st.subheader("Liabilities")
-        edit_lines(st.session_state.nw_edit_liab, "nweditl")
-        if st.button("Add liability", key="nw_edit_add_liab"):
-            st.session_state.nw_edit_liab.append(new_line())
-            st.rerun()
-        b1,b2=st.columns(2)
-        if b1.button("Save changes", type="primary", key="nw_edit_save"):
-            assets=collect_lines(st.session_state.nw_edit_assets, "Asset")
-            liabs=collect_lines(st.session_state.nw_edit_liab, "Liability")
-            if assets is None or liabs is None:
-                st.error("Give every amount a name.")
+    dates, series, kinds=build_series(types)
+    nw_vals=networth_values()
+    cash_vals=group_values(dates, series, kinds, "Cash")
+    inv_vals=group_values(dates, series, kinds, "Investment")
+
+    # ---------- headline cards ----------
+    if records:
+        last=dates[-1] if dates else None
+        prev=dates[-2] if len(dates)>1 else None
+        nw_now, nw_prev=float(records[0][4]), (float(records[1][4]) if len(records)>1 else None)
+        c_now, i_now=cash_vals.get(last, 0), inv_vals.get(last, 0)
+        k1,k2,k3,k4=st.columns(4)
+        kpi(k1, "Net worth", nw_now,
+            None if nw_prev is None else nw_now-nw_prev, pct_change(nw_now, nw_prev),
+            f"Snapshot {as_date(records[0][1]):%d %b %Y}", "#0f172a")
+        kpi(k2, "💶 Cash", c_now,
+            None if prev is None else c_now-cash_vals[prev], None if prev is None else pct_change(c_now, cash_vals[prev]),
+            "Everything except investments", CASH_COLORS[0])
+        kpi(k3, "📈 Investments", i_now,
+            None if prev is None else i_now-inv_vals[prev], None if prev is None else pct_change(i_now, inv_vals[prev]),
+            "Brokers & funds", INV_COLORS[0])
+        total=c_now+i_now
+        k4.markdown(f'<div class="kpi" style="--accent:#7c3aed"><div class="kpi-label">Allocation</div>'
+                    f'<div class="kpi-value">{(i_now/total*100 if total else 0):.0f}% <span style="font-size:1rem;color:#64748b">invested</span></div>'
+                    f'<div style="display:flex;height:10px;border-radius:6px;overflow:hidden;margin-top:12px">'
+                    f'<div style="width:{(c_now/total*100 if total else 0):.1f}%;background:{CASH_COLORS[0]}"></div>'
+                    f'<div style="width:{(i_now/total*100 if total else 0):.1f}%;background:{INV_COLORS[0]}"></div></div>'
+                    f'<div class="kpi-sub" style="margin-top:8px">{(c_now/total*100 if total else 0):.0f}% cash · '
+                    f'{(i_now/total*100 if total else 0):.0f}% investments</div></div>', unsafe_allow_html=True)
+        st.write("")
+
+    tab_growth, tab_change, tab_new, tab_edit, tab_router=st.tabs(
+        ["📈 Growth", "🔍 Monthly change", "➕ New snapshot", "✏️ Edit snapshot", "💸 Paycheck router"])
+
+    # ---------- growth ----------
+    with tab_growth:
+        @st.fragment
+        def growth_view():
+            if not dates:
+                st.info("No snapshots yet. Add your first one in the **➕ New snapshot** tab.")
+                return
+            c1, c2=st.columns([2, 1])
+            view=c1.segmented_control("View", ["By account", "Cash vs Investments"], default="By account", key="nw_view") or "By account"
+            rng=c2.segmented_control("Range", ["6M", "1Y", "All"], default="All", key="nw_range") or "All"
+            start=None
+            if rng!="All":
+                months=6 if rng=="6M" else 12
+                t=date.today(); total_m=t.year*12+t.month-1-months
+                start=date(total_m//12, total_m%12+1, 1)
+            ds=[d for d in dates if start is None or d>=start]
+            def ordered(kind):
+                return sorted([n for n in series if kinds[n]==kind], key=lambda n: -sum(series[n].values()))
+            fig=go.Figure()
+            hover="%{fullData.name}: € %{y:,.0f}<extra></extra>"
+            if view=="By account":
+                for gi,(kind, title, colors) in enumerate((("Cash","Cash",CASH_COLORS),("Investment","Investments",INV_COLORS))):
+                    for i, name in enumerate(ordered(kind)):
+                        fig.add_trace(go.Bar(name=name, x=ds, y=[series[name].get(d, 0) for d in ds],
+                                             marker_color=colors[i % len(colors)], legendgroup=kind,
+                                             legendgrouptitle_text=title if i==0 else None, hovertemplate=hover))
             else:
+                fig.add_trace(go.Bar(name="Cash", x=ds, y=[cash_vals[d] for d in ds], marker_color=CASH_COLORS[0], hovertemplate=hover))
+                fig.add_trace(go.Bar(name="Investments", x=ds, y=[inv_vals[d] for d in ds], marker_color=INV_COLORS[0], hovertemplate=hover))
+            nw_ds=[d for d in sorted(nw_vals) if start is None or d>=start]
+            fig.add_trace(go.Scatter(name="Net worth", x=nw_ds, y=[nw_vals[d] for d in nw_ds], mode="lines+markers",
+                                     line=dict(color="#0f172a", width=3, shape="spline"), marker=dict(size=7),
+                                     hovertemplate=hover))
+            fig.update_layout(barmode="stack", yaxis_title="€", hovermode="x unified", bargap=0.28)
+            style_chart(fig, 520)
+            fig.update_layout(margin=dict(t=16), legend=dict(traceorder="grouped+reversed" if view=="By account" else "reversed"))
+            fig.update_yaxes(tickprefix="€ ", separatethousands=True)
+            st.plotly_chart(fig, width="stretch", config=PLOT_CONFIG)
+            with st.expander("All snapshots"):
+                st.dataframe(pd.DataFrame([{
+                    "Date": as_date(r[1]), "Assets": float(r[2] or 0),
+                    "Liabilities": float(r[3] or 0), "Net worth": float(r[4] or 0)} for r in records]),
+                    width="stretch", hide_index=True,
+                    column_config={"Date": st.column_config.DateColumn(format="DD/MM/YYYY"),
+                                   **{k: st.column_config.NumberColumn(format="€ %.2f") for k in ("Assets","Liabilities","Net worth")}})
+        growth_view()
+
+    # ---------- monthly change ----------
+    with tab_change:
+        @st.fragment
+        def change_view():
+            if len(dates)<2:
+                st.info("You need snapshots from at least two different months to see monthly changes.")
+                return
+            opts={"💶 Cash": cash_vals, "📈 Investments": inv_vals, "💎 Net worth": nw_vals}
+            for kind, icon in (("Cash","🏦"),("Investment","📊")):
+                for n in sorted([n for n in series if kinds[n]==kind], key=str.lower):
+                    opts[f"{icon} {n}"]={d: series[n].get(d, 0) for d in dates}
+            c1, c2=st.columns([2, 1])
+            sel=c1.selectbox("What do you want to look at?", list(opts), key="mc_sel",
+                             help="Cash = every account except investments. You can also pick a single account.")
+            rows=monthly_series(opts[sel])
+            if rng_rows:=c2.segmented_control("Range", ["6M", "1Y", "All"], default="1Y", key="mc_range"):
+                if rng_rows!="All":
+                    rows=rows[-(int(rng_rows[:-1])*(12 if rng_rows.endswith("Y") else 1))-1:]
+            ch=[r for r in rows if r["change"] is not None]
+            if not ch:
+                st.info("Not enough months in this range yet.")
+                return
+            lastr=ch[-1]
+            first=rows[0]
+            avg=sum(r["change"] for r in ch)/len(ch)
+            best=max(ch, key=lambda r: r["change"]); worst=min(ch, key=lambda r: r["change"])
+            m1,m2,m3,m4=st.columns(4)
+            m1.metric(f"Last month · {lastr['month']:%b %Y}", signed_euro(lastr["change"]),
+                      f"{lastr['pct']:+.1f}%" if lastr["pct"] is not None else None)
+            m2.metric("Average per month", signed_euro(avg),
+                      f"{sum(r['pct'] for r in ch if r['pct'] is not None)/max(1,len([r for r in ch if r['pct'] is not None])):+.1f}%")
+            tot=rows[-1]["value"]-first["value"]
+            tp=pct_change(rows[-1]["value"], first["value"])
+            m3.metric(f"Total since {first['month']:%b %Y}", signed_euro(tot), f"{tp:+.1f}%" if tp is not None else None)
+            m4.metric("Best / worst month", f"{best['month']:%b} {signed_euro(best['change'])}",
+                      f"{worst['month']:%b %Y}: {signed_euro(worst['change'])}", delta_color="off")
+
+            fig=make_subplots(specs=[[{"secondary_y": True}]])
+            fig.add_trace(go.Bar(name="Change (€)", x=[r["month"] for r in ch], y=[r["change"] for r in ch],
+                                 marker_color=["#16a34a" if r["change"]>=0 else "#dc2626" for r in ch],
+                                 text=[f"{r['pct']:+.1f}%" if r["pct"] is not None else "new" for r in ch],
+                                 textposition="outside", cliponaxis=False,
+                                 customdata=[[signed_euro(r["change"]), f"{r['pct']:+.2f}%" if r["pct"] is not None else "—"] for r in ch],
+                                 hovertemplate="%{x|%b %Y}<br>%{customdata[0]} (%{customdata[1]})<extra></extra>"),
+                          secondary_y=False)
+            fig.add_trace(go.Scatter(name="Balance", x=[r["month"] for r in ch], y=[r["value"] for r in ch],
+                                     mode="lines+markers", line=dict(color="#0f172a", width=2.5, shape="spline"),
+                                     hovertemplate="Balance € %{y:,.0f}<extra></extra>"), secondary_y=True)
+            style_chart(fig, 460)
+            fig.update_layout(margin=dict(t=24), hovermode="x unified", bargap=0.35)
+            fig.update_xaxes(dtick="M1", tickformat="%b\n%Y")
+            fig.update_yaxes(title_text="Monthly change (€)", tickprefix="€ ", separatethousands=True, secondary_y=False)
+            fig.update_yaxes(title_text="Balance (€)", tickprefix="€ ", separatethousands=True, showgrid=False, secondary_y=True)
+            st.plotly_chart(fig, width="stretch", config=PLOT_CONFIG)
+
+            table=pd.DataFrame([{"Month": r["month"].strftime("%b %Y"), "Balance": r["value"],
+                                 "Change €": r["change"], "Change %": r["pct"]} for r in reversed(rows)])
+            def color(v):
+                if v is None or pd.isna(v): return "color:#94a3b8"
+                return "color:#16a34a;font-weight:600" if v>0 else "color:#dc2626;font-weight:600" if v<0 else ""
+            styled=(table.style
+                    .format({"Balance": "€ {:,.2f}",
+                             "Change €": lambda v: "—" if pd.isna(v) else signed_euro(v),
+                             "Change %": lambda v: "—" if pd.isna(v) else f"{v:+.2f}%"})
+                    .map(color, subset=["Change €", "Change %"]))
+            st.dataframe(styled, width="stretch", hide_index=True)
+        change_view()
+
+    # ---------- new snapshot ----------
+    with tab_new:
+        @st.fragment
+        def new_snapshot():
+            ver=st.session_state.setdefault("nw_new_ver", 0)
+            base_key=f"nw_new_base_{ver}"
+            if base_key not in st.session_state:
+                a, l, src=default_lines()
+                st.session_state[base_key]=(lines_df(a, True), lines_df(l, False), src)
+            adf, ldf, src=st.session_state[base_key]
+            if src:
+                st.caption(f"Pre-filled with your accounts and balances from **{src:%d/%m/%Y}**. "
+                           "Just update the amounts and save. Add a row at the bottom of the table, or select a row and delete it.")
+            else:
+                st.caption("One row per account. Mark each one as Cash or Investment — next month they'll be pre-filled for you.")
+            d=st.date_input("Snapshot date", date.today(), key="nw_new_date", format="DD/MM/YYYY")
+            if any(as_date(r[1]).year==d.year and as_date(r[1]).month==d.month for r in records):
+                st.warning(f"You already have a snapshot for {d:%B %Y}. Saving adds a second one — "
+                           "to change the existing one, use **✏️ Edit snapshot**.")
+            st.markdown("**Assets**")
+            ea=lines_editor(adf, f"nw_new_a_{ver}", True)
+            with st.expander("Liabilities (loans, credit cards)", expanded=not ldf.empty):
+                el=lines_editor(ldf, f"nw_new_l_{ver}", False)
+            assets=items_from_df(ea, "Asset"); liabs=items_from_df(el, "Liability")
+            if assets is not None and liabs is not None:
+                cash=sum(i["amount"] for i in assets if i["group"]=="Cash")
+                inv=sum(i["amount"] for i in assets if i["group"]=="Investment")
+                debt=sum(i["amount"] for i in liabs)
+                p1,p2,p3=st.columns(3)
+                nw_prev=float(records[0][4]) if records else None
+                p1.metric("Cash", euro(cash)); p2.metric("Investments", euro(inv))
+                p3.metric("Net worth", euro(cash+inv-debt),
+                          None if nw_prev is None else f"{signed_euro(cash+inv-debt-nw_prev)} vs last")
+            if st.button("Save snapshot", type="primary", key="nw_save_new", width="stretch"):
+                if assets is None or liabs is None:
+                    st.error("Give every amount an account name.")
+                    return
+                items=merge_items(assets+liabs)
+                if not items:
+                    st.warning("Enter at least one amount.")
+                    return
+                save_snapshot(d, items)
+                st.session_state.nw_new_ver=ver+1
+                st.session_state.nw_edit_ver=st.session_state.get("nw_edit_ver", 0)+1
+                st.toast("Snapshot saved ✅")
+                st.rerun()
+        new_snapshot()
+
+    # ---------- edit snapshot ----------
+    with tab_edit:
+        @st.fragment
+        def edit_snapshot():
+            if not records:
+                st.info("Nothing to edit yet.")
+                return
+            ids=[r[0] for r in records]
+            labels={r[0]: f"{as_date(r[1]):%d/%m/%Y} · {euro(r[4])}" for r in records}
+            if st.session_state.get("nw_pick") not in ids:
+                st.session_state.nw_pick=ids[0]
+            pick=st.selectbox("Snapshot", ids, format_func=lambda i: labels[i], key="nw_pick")
+            chosen=next(r for r in records if r[0]==pick)
+            ver=st.session_state.setdefault("nw_edit_ver", 0)
+            base_key=f"nw_edit_base_{pick}_{ver}"
+            if base_key not in st.session_state:
+                a, l=lines_from_snapshot(pick, types)
+                st.session_state[base_key]=(lines_df(a, True), lines_df(l, False))
+            adf, ldf=st.session_state[base_key]
+            nd=st.date_input("Snapshot date", as_date(chosen[1]), key=f"nw_edit_d_{pick}_{ver}", format="DD/MM/YYYY")
+            st.markdown("**Assets**")
+            ea=lines_editor(adf, f"nw_edit_a_{pick}_{ver}", True)
+            with st.expander("Liabilities", expanded=not ldf.empty):
+                el=lines_editor(ldf, f"nw_edit_l_{pick}_{ver}", False)
+            b1, b2=st.columns([3, 1])
+            if b1.button("Save changes", type="primary", key="nw_edit_save", width="stretch"):
+                assets=items_from_df(ea, "Asset"); liabs=items_from_df(el, "Liability")
+                if assets is None or liabs is None:
+                    st.error("Give every amount an account name.")
+                    return
                 items=merge_items(assets+liabs)
                 if not items:
                     st.warning("Enter at least one amount, or delete the snapshot.")
-                else:
-                    replace_snapshot(pick, nd, items)
-                    st.session_state.nw_edit_id=None
-                    st.toast("Snapshot aggiornato")
+                    return
+                replace_snapshot(pick, nd, items)
+                st.session_state.nw_edit_ver=ver+1
+                st.session_state.nw_new_ver=st.session_state.get("nw_new_ver", 0)+1
+                st.toast("Snapshot updated ✅")
+                st.rerun()
+            with b2.popover("🗑️ Delete", width="stretch"):
+                st.write(f"Delete the snapshot from **{as_date(chosen[1]):%d/%m/%Y}**? This can't be undone.")
+                if st.button("Yes, delete it", type="primary", key="nw_edit_delete"):
+                    remove_snapshot(pick)
+                    st.session_state.nw_edit_ver=ver+1
+                    st.session_state.nw_new_ver=st.session_state.get("nw_new_ver", 0)+1
+                    st.toast("Snapshot deleted")
                     st.rerun()
-        if b2.button("Delete this snapshot", key="nw_edit_delete"):
-            remove_snapshot(pick)
-            st.session_state.nw_edit_id=None
-            st.toast("Snapshot eliminato")
-            st.rerun()
-    st.divider()
-    st.header("4. Paycheck Router")
-    existing={r[0]:float(r[1]) for r in fetch_all("SELECT account_name,percentage FROM routing_rules")}
-    with st.form("routing"):
-        c1,c2,c3=st.columns(3); p1=c1.number_input("Checking %",0.,100.,existing.get("Checking",50.),1.); p2=c2.number_input("Savings %",0.,100.,existing.get("Savings",30.),1.); p3=c3.number_input("Investments %",0.,100.,existing.get("Investments",20.),1.)
-        if st.form_submit_button("Save rules"):
-            if abs(p1+p2+p3-100)>1e-9: st.error("Devono essere esattamente 100%.")
-            else:
-                for name,p in [("Checking",p1),("Savings",p2),("Investments",p3)]: execute("INSERT INTO routing_rules(account_name,percentage) VALUES(?,?) ON CONFLICT(account_name) DO UPDATE SET percentage=excluded.percentage",[name,p])
-                st.success("Regole salvate."); st.rerun()
-    paycheck=st.number_input("Net paycheck",min_value=0.,step=100.,format="%.2f")
-    if abs(p1+p2+p3-100)<1e-9:
-        c1,c2,c3=st.columns(3); c1.metric("Checking",euro(paycheck*p1/100),f"{p1:.1f}%"); c2.metric("Savings",euro(paycheck*p2/100),f"{p2:.1f}%"); c3.metric("Investments",euro(paycheck*p3/100),f"{p3:.1f}%")
+        edit_snapshot()
+
+    # ---------- paycheck router ----------
+    with tab_router:
+        existing={r[0]:float(r[1]) for r in fetch_all("SELECT account_name,percentage FROM routing_rules")}
+        st.caption("Split each paycheck automatically. The three percentages must add up to 100%.")
+        with st.form("routing"):
+            c1,c2,c3=st.columns(3)
+            p1=c1.number_input("Checking %",0.,100.,existing.get("Checking",50.),1.)
+            p2=c2.number_input("Savings %",0.,100.,existing.get("Savings",30.),1.)
+            p3=c3.number_input("Investments %",0.,100.,existing.get("Investments",20.),1.)
+            if st.form_submit_button("Save rules"):
+                if abs(p1+p2+p3-100)>1e-9: st.error("They must add up to exactly 100%.")
+                else:
+                    for name,p in [("Checking",p1),("Savings",p2),("Investments",p3)]:
+                        execute("INSERT INTO routing_rules(account_name,percentage) VALUES(?,?) ON CONFLICT(account_name) DO UPDATE SET percentage=excluded.percentage",[name,p])
+                    st.toast("Rules saved ✅"); st.rerun()
+        paycheck=st.number_input("Net paycheck (€)",min_value=0.,step=100.,format="%.2f")
+        if abs(p1+p2+p3-100)<1e-9:
+            c1,c2,c3=st.columns(3)
+            c1.metric("Checking",euro(paycheck*p1/100),f"{p1:.1f}%",delta_color="off")
+            c2.metric("Savings",euro(paycheck*p2/100),f"{p2:.1f}%",delta_color="off")
+            c3.metric("Investments",euro(paycheck*p3/100),f"{p3:.1f}%",delta_color="off")
 # =====================================================================
 # AI
 # =====================================================================

@@ -73,6 +73,18 @@ def get_db() -> duckdb.DuckDBPyConnection:
     """)
     con.execute("CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(transaction_date)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_transactions_category ON transactions(category)")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS account_types (
+            name VARCHAR PRIMARY KEY,
+            kind VARCHAR NOT NULL CHECK(kind IN ('Cash','Investment'))
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS category_rules (
+            merchant VARCHAR PRIMARY KEY,
+            category VARCHAR NOT NULL
+        )
+    """)
     _ensure_net_worth_items(con)
     return con
 

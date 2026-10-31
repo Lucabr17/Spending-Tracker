@@ -62,12 +62,62 @@ KEYWORD_CATEGORIES={
 "cinema":"Entertainment","teatro":"Entertainment","theatre":"Entertainment","concerto":"Entertainment",
 "steam":"Entertainment","playstation":"Entertainment",
 "parrucchiere":"Personal","barbiere":"Personal","palestra":"Personal","gym":"Personal",
+# Australia
+"woolworths":"Groceries","woolies":"Groceries","coles":"Groceries","iga":"Groceries","foodland":"Groceries",
+"harris farm":"Groceries","costco":"Groceries","nightcliff":"Groceries",
+"menulog":"Dining Out","doordash":"Dining Out","hungry jacks":"Dining Out","kfc":"Dining Out","subway":"Dining Out",
+"domino":"Dining Out","dominos":"Dining Out","guzman":"Dining Out","oporto":"Dining Out","red rooster":"Dining Out",
+"grill'd":"Dining Out","zambrero":"Dining Out","cafe":"Dining Out","coffee":"Dining Out","bakery":"Dining Out",
+"bp":"Transport","ampol":"Transport","caltex":"Transport","7-eleven":"Transport","united petroleum":"Transport",
+"puma energy":"Transport","coles express":"Transport","shell coles express":"Transport","translink":"Transport","didi":"Transport","ola":"Transport",
+"bunnings":"Shopping","kmart":"Shopping","big w":"Shopping","target":"Shopping","jb hi-fi":"Shopping","jb hifi":"Shopping",
+"officeworks":"Shopping","harvey norman":"Shopping","rebel":"Shopping","temu":"Shopping","ebay":"Shopping",
+"dan murphy":"Shopping","bws":"Shopping","liquorland":"Shopping","myer":"Shopping","david jones":"Shopping","uniqlo":"Shopping",
+"qantas":"Travel","jetstar":"Travel","virgin australia":"Travel","expedia":"Travel","agoda":"Travel",
+"telstra":"Utilities","optus":"Utilities","aussie broadband":"Utilities","jacana":"Utilities","power and water":"Utilities",
+"origin energy":"Utilities","agl":"Utilities","amaysim":"Utilities","boost mobile":"Utilities",
+"chemist warehouse":"Healthcare","priceline":"Healthcare","terry white":"Healthcare","medibank":"Insurance","bupa":"Insurance",
+"nrma":"Insurance","aami":"Insurance","allianz":"Insurance","youi":"Insurance","budget direct":"Insurance",
+"anytime fitness":"Personal","jetts":"Personal","f45":"Personal","snap fitness":"Personal",
+"hoyts":"Entertainment","event cinemas":"Entertainment","ticketek":"Entertainment","ticketmaster":"Entertainment",
+"apple.com":"Subscriptions","google play":"Subscriptions","stan":"Subscriptions","binge":"Subscriptions","kayo":"Subscriptions",
+"paramount+":"Subscriptions","audible":"Subscriptions","adobe":"Subscriptions","microsoft":"Subscriptions","openai":"Subscriptions",
+"claude.ai":"Subscriptions","anthropic":"Subscriptions","canva":"Subscriptions","x premium":"Subscriptions",
+"ato":"Taxes","rent":"Housing","real estate":"Housing",
+"commsec":"Investing","stake":"Investing","raiz":"Investing","spaceship":"Investing","pearler":"Investing",
+"trading 212":"Investing","mexem":"Investing","interactive brokers":"Investing","vanguard":"Investing",
+"interest":"Other Income","refund":"Other Income","dividend":"Other Income",
 }
+
+MERCHANT_NOISE={
+"card","purchase","eftpos","visa","debit","pos","payment","value","date","pending","contactless","tap",
+"sq","sqr","pty","ltd","the","and","at","to","from","www","com","au","aus","nt","nsw","vic","qld","wa","sa","tas","act",
+"darwin","sydney","melbourne","brisbane","perth","adelaide","au","usa","us","nz","int","intl","ref","receipt","transaction",
+"oggi","ieri","today","yesterday","pagamento","carta","acquisto","presso","bonifico","di","del","della","il","la",
+}
+
+def merchant_key(description):
+    """Stable short name for a merchant, e.g. 'WOOLWORTHS 1234 DARWIN NT' -> 'woolworths'."""
+    toks=re.findall(r"[a-zàèéìòù][a-zàèéìòù'&.+-]*", _norm(description))
+    toks=[t.strip(".'-") for t in toks]
+    toks=[t for t in toks if len(t)>1 and t not in MERCHANT_NOISE]
+    return " ".join(toks[:2])
+
+def merchant_keys(description):
+    """(two-word key, first-word key) used to remember categories you pick."""
+    full=merchant_key(description)
+    first=full.split(" ")[0] if full else ""
+    return full, (first if len(first)>=3 and first!=full else "")
+
+def _norm(text):
+    # Bank feeds write merchants like "UBER *EATS" or "SQ *CAFE": treat symbols as spaces.
+    return re.sub(r"\s+", " ", re.sub(r"[*#_|\\/]+", " ", (text or "").lower())).strip()
 
 def _has_keyword(text, keyword):
     k=(keyword or "").lower().strip()
     if not k: return False
-    return re.search(rf"(?<![a-z0-9àèéìòù]){re.escape(k)}(?![a-z0-9àèéìòù])", (text or "").lower()) is not None
+    # allow a plural/possessive ending: "mcdonald" matches "McDonalds" and "McDonald's"
+    return re.search(rf"(?<![a-z0-9àèéìòù]){re.escape(k)}(?:'?s)?(?![a-z0-9àèéìòù])", _norm(text)) is not None
 
 def auto_categorize(text, transaction_type=None):
     t=(text or "").lower()
@@ -318,7 +368,16 @@ def _gemini_image_transactions(image):
     client=get_gemini_client()
     if not client: return []
     model=get_secret('GEMINI_MODEL') or 'gemini-3.6-flash'
-    prompt="Read this receipt or bank/card screenshot and return ONLY JSON: {\"transactions\":[{\"date\":\"YYYY-MM-DD\",\"amount\":12.34,\"description\":\"merchant\",\"type\":\"Expense\"}]} Extract every visible transaction. Use the date shown in the image, never today. Ignore rows marked REVERTED, REVERSED, CANCELLED or STORNATO. Do not invent missing values."
+    prompt=("Read this receipt or bank/card app screenshot and return ONLY JSON: "
+            '{"transactions":[{"date":"YYYY-MM-DD","amount":12.34,"description":"merchant","type":"Expense","category":"Groceries"}]} '
+            "Extract every visible transaction. Use the date shown in the image (headers like 'Today' or 'Yesterday' are relative to "
+            f"{date.today().isoformat()}); if no year is shown use the most recent past date. "
+            "amount is always positive. type is Income for money received (shown with +, green, 'received', 'deposit', salary, refund) "
+            "and Expense otherwise. description is the clean merchant or payer name, without card numbers or locations. "
+            f"category must be exactly one of {EXPENSE_CATEGORIES} for expenses or one of {INCOME_CATEGORIES} for income; "
+            "pick the best fit for the merchant (supermarkets=Groceries, fuel/ride-share/public transport=Transport, "
+            "restaurants/cafes/food delivery=Dining Out, streaming/software=Subscriptions, phone/internet/power=Utilities). "
+            "Ignore rows marked REVERTED, REVERSED, CANCELLED, DECLINED or STORNATO and ignore balance lines. Do not invent values.")
     try:
         response=client.models.generate_content(model=model,contents=[prompt,image])
         raw=re.sub(r'^```(?:json)?\s*|\s*```$','',(response.text or '').strip(),flags=re.I|re.S)
@@ -328,17 +387,20 @@ def _gemini_image_transactions(image):
             d=parse_date(row.get('date')); amount=parse_amount(row.get('amount')); desc=str(row.get('description') or '').strip()
             if d and amount is not None and desc:
                 typ='Income' if str(row.get('type','Expense')).lower().startswith('inc') else 'Expense'
-                cat=auto_categorize(desc, typ)
+                kw=auto_categorize(desc, typ)
+                ai=str(row.get('category') or '').strip()
+                # Trust a specific keyword match; otherwise use Gemini's choice when it is valid.
+                cat=kw if kw not in ('Other','Other Income') else (ai if ai in categories_for(typ) else kw)
                 out.append({'transaction_date':d,'amount':abs(amount),'category':cat,'transaction_type':typ,'description':desc})
         return out
     except Exception: return []
 
 def extract_image_transactions(image):
-    text=_ocr_text(image); rows=_parse_ocr_transactions(text)
-    if not rows:
-        vision=_gemini_image_transactions(image)
-        if vision: return vision,text
-    return rows,text
+    """Gemini Vision first (reads layouts and categories best), local OCR as the fallback."""
+    vision=_gemini_image_transactions(image)
+    if vision: return vision,''
+    text=_ocr_text(image)
+    return _parse_ocr_transactions(text),text
 
 def extract_receipt_data(image):
     rows,raw_text=extract_image_transactions(image)
