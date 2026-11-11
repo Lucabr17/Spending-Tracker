@@ -15,7 +15,22 @@ import re
 from datetime import timedelta
 
 import db as _db
-from db import fetch_all, fetch_one, get_db, get_historical_month_count
+from db import get_db
+
+def _safe_execute(sql, params=None):
+    """One cursor per query, so overlapping page loads can never read each other's results."""
+    return get_db().cursor().execute(sql, list(params) if params is not None else None)
+_db.execute=_safe_execute          # also used by every helper inside db.py
+
+def fetch_all(sql, params=None):
+    return _safe_execute(sql, params).fetchall()
+
+def fetch_one(sql, params=None):
+    rows=fetch_all(sql, params)
+    return rows[0] if rows else None
+
+def get_historical_month_count():
+    return int(_q("SELECT COUNT(DISTINCT DATE_TRUNC('month',transaction_date)) FROM transactions")[0][0] or 0)
 
 # Every write goes through these wrappers so cached pages refresh straight away.
 def _writes(fn):
@@ -73,9 +88,9 @@ div[data-testid="stMetricLabel"] p{font-weight:600;color:#475569}
 .expense{border-left:5px solid #dc2626;background:#fef2f2}
 .sub{font-size:.92rem;font-weight:650;margin-top:.35rem}
 .kpi{background:#fff;border:1px solid rgba(100,116,139,.16);border-radius:18px;padding:18px 20px 16px;
-     box-shadow:0 1px 3px rgba(15,23,42,.05);border-top:4px solid var(--accent,#2563eb);height:100%}
+     box-shadow:0 1px 3px rgba(15,23,42,.05);border-top:4px solid var(--accent,#2563eb);height:100%;min-height:148px}
 .kpi-label{font-size:.78rem;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:#64748b}
-.kpi-value{font-size:1.9rem;font-weight:800;color:#0f172a;margin-top:6px;line-height:1.15}
+.kpi-value{font-size:clamp(1.15rem,1.75vw,1.9rem);font-weight:800;color:#0f172a;margin-top:6px;line-height:1.15;white-space:nowrap}
 .kpi-delta{font-size:.92rem;font-weight:650;margin-top:6px}
 .kpi-sub{font-size:.8rem;color:#94a3b8;margin-top:2px}
 .pill{display:inline-block;padding:2px 10px;border-radius:999px;font-size:.78rem;font-weight:650;background:#eff6ff;color:#1d4ed8}
@@ -128,7 +143,7 @@ def style_chart(fig, height=480):
     fig.update_yaxes(gridcolor="rgba(148,163,184,.28)", zeroline=False, automargin=True, title_standoff=12)
     return fig
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _q(sql, params=None):
     """Cached read for the Wealth page. Cleared whenever a snapshot changes."""
     return fetch_all(sql, params)
@@ -230,6 +245,7 @@ def _net_worth_setup():
         )
     """)
     execute("CREATE TABLE IF NOT EXISTS app_meta (key VARCHAR PRIMARY KEY, value VARCHAR)")
+    execute("CREATE TABLE IF NOT EXISTS recurring_ignored (merchant VARCHAR PRIMARY KEY)")
     if not fetch_one("SELECT 1 FROM app_meta WHERE key='account_types_v2'"):
         # One-time fix: brokers like Trading 212 / MEXEM were saved as Investment by the old default.
         execute("UPDATE account_types SET kind='Cash' WHERE kind='Investment' AND lower(name) NOT LIKE '%invest%'")
@@ -600,17 +616,251 @@ def learn_category(description, category):
             execute("INSERT INTO category_rules(merchant,category) VALUES(?,?) "
                     "ON CONFLICT(merchant) DO UPDATE SET category=excluded.category", [key, category])
 
-def smart_category(description, transaction_type, suggested):
-    """Your past choice for this exact merchant > a specific keyword/AI match > your choice for the brand > guess."""
+def category_memory():
+    """What the app knows about your habits: categories you confirmed + the usual category per merchant in your history."""
     ensure_net_worth_items()
+    rules={m: c for m, c in _q("SELECT merchant, category FROM category_rules")}
+    counts={}
+    for desc, cat, typ, n in _q("""SELECT description, category, transaction_type, COUNT(*) FROM transactions
+            WHERE coalesce(description,'')<>'' AND category NOT IN ('Other','Other Income') GROUP BY 1,2,3"""):
+        for key in merchant_keys(re.sub(r"\(recurring\)", "", desc)):
+            if key:
+                c=counts.setdefault((key, typ), {}); c[cat]=c.get(cat, 0)+int(n)
+    usual={k: max(v, key=v.get) for k, v in counts.items()}
+    return rules, usual
+
+def smart_category(description, transaction_type, suggested, memory=None):
+    """Your confirmed choice for this merchant > what you usually pick for it > keyword/AI match > same brand > guess."""
+    rules, usual=memory or category_memory()
     valid=categories_for(transaction_type)
     full, first=merchant_keys(description)
-    rules={k: c for k, c in fetch_all("SELECT merchant, category FROM category_rules WHERE merchant IN (?, ?)",
-                                     [full or "", first or ""]) if c in valid}
-    if full in rules: return rules[full], "learned"
+    ok=lambda c: c in valid
+    if ok(rules.get(full)): return rules[full], "learned"
+    if ok(usual.get((full, transaction_type))): return usual[(full, transaction_type)], "learned"
     if suggested in valid and suggested not in ("Other", "Other Income"): return suggested, "auto"
-    if first in rules: return rules[first], "learned"
+    if first and ok(rules.get(first)): return rules[first], "learned"
+    if first and ok(usual.get((first, transaction_type))): return usual[(first, transaction_type)], "learned"
     return (suggested if suggested in valid else valid[0]), "auto"
+
+def tx_key(d, amount, description):
+    return (as_date(d), round(float(amount), 2), merchant_keys(re.sub(r"\(recurring\)", "", description or ""))[0])
+
+def saved_tx_index(start, end):
+    """Transactions already saved around these dates, for spotting duplicates before importing."""
+    rows=_q("""SELECT transaction_date, amount, description, coalesce(source,'') FROM transactions
+               WHERE transaction_date>=? AND transaction_date<=?""", [start-timedelta(days=4), end+timedelta(days=4)])
+    exact={tx_key(d, a, desc) for d, a, desc, _ in rows}
+    recurring=[tx_key(d, a, desc) for d, a, desc, src in rows if src=="recurring"]
+    return exact, recurring
+
+def already_saved(row, index):
+    exact, recurring=index
+    k=tx_key(row["transaction_date"], row["amount"], row.get("description"))
+    if k in exact: return True
+    # an auto-added recurring payment may land a few days before/after the bank shows it
+    return any(abs(r[1]-k[1])<0.01 and abs((r[0]-k[0]).days)<=3 and r[2] and k[2] and r[2].split(" ")[0]==k[2].split(" ")[0]
+               for r in recurring)
+
+def recurring_suggestions():
+    """Payments that look like subscriptions: same merchant, about once a month, similar amount and day."""
+    ensure_net_worth_items()
+    since=add_months(MONTH_START, -6)
+    rows=_q(f"""SELECT description, category, transaction_date, amount FROM transactions
+               WHERE transaction_type='Expense' AND transaction_date>=? AND coalesce(source,'')<>'recurring'
+                 AND category NOT IN {_NS_SQL} AND coalesce(description,'')<>''""", [since])
+    known={merchant_keys(n)[0] for (n,) in _q("SELECT name FROM recurring_expenses")}
+    known|={m for (m,) in _q("SELECT merchant FROM recurring_ignored")}
+    groups={}
+    for desc, cat, d, amt in rows:
+        key=merchant_keys(desc)[0]
+        if key and key not in known:
+            groups.setdefault(key, []).append((as_date(d), float(amt), cat, desc))
+    out=[]
+    for key, items in groups.items():
+        items.sort()
+        months={(d.year, d.month) for d, *_ in items}
+        amounts=sorted(a for _, a, *_ in items)
+        median=amounts[len(amounts)//2]
+        days=[d.day for d, *_ in items]
+        if (len(months)>=3 and len(items)<=len(months)+1
+                and amounts[-1]-amounts[0]<=max(1.0, median*0.12)
+                and max(days)-min(days)<=8
+                and items[-1][0]>=add_months(MONTH_START, -2)):
+            last_d, last_a, _, last_desc=items[-1]
+            cats=[c for _, _, c, _ in items]
+            nxt=last_d
+            while nxt<=TODAY:
+                m=add_months(nxt.replace(day=1), 1)
+                nxt=m.replace(day=min(last_d.day, 28))
+            out.append({"key": key, "Name": re.sub(r"\.(com|au|it|net|co)\b", "", key).strip().title() or last_desc.strip(),
+                        "Amount": last_a, "Category": max(set(cats), key=cats.count),
+                        "Seen": f"{len(months)} months", "Next due": nxt})
+    return sorted(out, key=lambda x: -x["Amount"])
+
+# ---------------------------------------------------------------------
+# Monthly summary
+# ---------------------------------------------------------------------
+def summary_data(month):
+    """Everything the monthly summary shows, for the month starting at `month`."""
+    start, end, pstart=month, add_months(month, 1), add_months(month, -1)
+    cur, prev=tx_totals(start, end), tx_totals(pstart, start)
+    cats, pcats=cat_totals(start, end), cat_totals(pstart, start)
+    moves=sorted(((c, cats.get(c, 0)-pcats.get(c, 0)) for c in set(cats)|set(pcats)), key=lambda x: x[1])
+    budgets=get_budgets()
+    over=[(c, cats.get(c, 0)-lim) for c, lim in budgets.items() if cats.get(c, 0)>lim]
+    big=_q(f"""SELECT transaction_date, amount, category, description FROM transactions
+               WHERE transaction_type='Expense' AND category NOT IN {_NS_SQL} AND transaction_date>=? AND transaction_date<?
+               ORDER BY amount DESC LIMIT 3""", [start, end])
+    dates, series, kinds=build_series(get_account_types())
+    nw=networth_values()
+    def at(limit):
+        ds=[d for d in dates if d<limit]
+        if not ds: return None
+        d=ds[-1]
+        return {"date": d, "cash": sum(v.get(d, 0) for n, v in series.items() if kinds[n]=="Cash"),
+                "inv": sum(v.get(d, 0) for n, v in series.items() if kinds[n]=="Investment"), "nw": nw.get(d)}
+    w_now, w_prev=at(end), at(start)
+    if w_now and w_now["date"]<start: w_now=None            # no snapshot taken during this month
+    rec=_q("SELECT name, amount FROM recurring_expenses WHERE active AND next_due_date>=? AND next_due_date<?", [end, add_months(end, 1)])
+    return {"month": month, "cur": cur, "prev": prev, "cats": cats, "pcats": pcats, "moves": moves, "budgets": budgets,
+            "over": over, "big": big, "w_now": w_now, "w_prev": w_prev, "recurring_next": rec}
+
+def summary_highlights(s):
+    cur, prev, m=s["cur"], s["prev"], s["month"]
+    pm=add_months(m, -1)
+    out=[]
+    if cur["rate"] is not None:
+        out.append(f"You saved <b>{euro(cur['net'])}</b>, a savings rate of <b>{cur['rate']:.0f}%</b>"
+                   + ("." if prev["rate"] is None else f" (about the same as {pm:%B})." if abs(cur["rate"]-prev["rate"])<0.5
+                      else f" ({cur['rate']-prev['rate']:+.0f} points vs {pm:%B})."))
+    ch=pct_change(cur["expenses"], prev["expenses"])
+    if ch is not None:
+        out.append(f"Spending was <b>{euro(cur['expenses'])}</b>, {abs(ch):.0f}% {'lower' if ch<0 else 'higher'} than {pm:%B}.")
+    if cur["invested"]:
+        out.append(f"You invested <b>{euro(cur['invested'])}</b>" + (f", {cur['invest_rate']:.0f}% of your income." if cur["invest_rate"] is not None else "."))
+    if s["cats"]:
+        top=next(iter(s["cats"].items()))
+        out.append(f"Biggest category: <b>{top[0]}</b> at {euro(top[1])} ({top[1]/cur['expenses']*100:.0f}% of spending).")
+    if s["moves"] and s["moves"][-1][1]>0:
+        out.append(f"Biggest increase: <b>{s['moves'][-1][0]}</b>, up {euro(s['moves'][-1][1])}.")
+    if s["moves"] and s["moves"][0][1]<0:
+        out.append(f"Biggest saving: <b>{s['moves'][0][0]}</b>, down {euro(-s['moves'][0][1])}.")
+    if s["budgets"]:
+        if s["over"]:
+            out.append("Over budget in " + ", ".join(f"<b>{c}</b> (+{euro(v)})" for c, v in sorted(s["over"], key=lambda x: -x[1])) + ".")
+        else:
+            out.append(f"You stayed within all <b>{len(s['budgets'])}</b> budgets. 🎯")
+    if s["recurring_next"]:
+        out.append(f"Coming up in {add_months(m, 1):%B}: {len(s['recurring_next'])} recurring payment(s) totalling "
+                   f"<b>{euro(sum(float(a) for _, a in s['recurring_next']))}</b>.")
+    return out
+
+def summary_html(month):
+    """Self-contained HTML (inline styles) used on screen, for download and for the email."""
+    s=summary_data(month); cur, prev=s["cur"], s["prev"]; pm=add_months(month, -1)
+    def tile(label, value, delta, color, invert=False, text=None):
+        d=""
+        if delta is not None and (prev["count"] or delta):
+            good=(delta<0) if invert else (delta>0)
+            c="#64748b" if not delta else "#16a34a" if good else "#dc2626"
+            d=f'<div style="font-size:13px;font-weight:600;color:{c};margin-top:4px">{signed_euro(delta) if text is None else f"{delta:+.1f} pp"} vs {pm:%b}</div>'
+        v=text if text is not None else (("−"+euro(abs(value))) if value<0 else euro(value))
+        return (f'<td style="padding:6px;width:25%;vertical-align:top;border:0"><div style="background:#ffffff;border:1px solid #e2e8f0;border-top:4px solid {color};'
+                f'border-radius:12px;padding:14px 16px"><div style="font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:#64748b">{label}</div>'
+                f'<div style="font-size:22px;font-weight:800;color:#0f172a;margin-top:4px">{v}</div>{d}</div></td>')
+    rate, prate=cur["rate"], prev["rate"]
+    tiles=(tile("Income", cur["income"], cur["income"]-prev["income"], "#16a34a")
+           +tile("Spending", cur["expenses"], cur["expenses"]-prev["expenses"], "#dc2626", invert=True)
+           +tile("Invested", cur["invested"], cur["invested"]-prev["invested"], "#7c3aed")
+           +tile("Savings rate", 0, None if rate is None or prate is None else rate-prate, "#2563eb",
+                 text="—" if rate is None else f"{rate:.0f}%"))
+    hl="".join(f'<li style="margin:6px 0">{h}</li>' for h in summary_highlights(s)) or "<li>No transactions recorded this month.</li>"
+    rows=""
+    for c, v in list(s["cats"].items())[:8]:
+        dlt=v-s["pcats"].get(c, 0)
+        col="#dc2626" if dlt>0 else "#16a34a" if dlt<0 else "#64748b"
+        rows+=(f'<tr><td style="padding:7px 10px;border-bottom:1px solid #f1f5f9">{escape(c)}</td>'
+               f'<td style="padding:7px 10px;border-bottom:1px solid #f1f5f9;text-align:right;font-weight:600">{euro(v)}</td>'
+               f'<td style="padding:7px 10px;border-bottom:1px solid #f1f5f9;text-align:right;color:{col}">{signed_euro(dlt)}</td></tr>')
+    cat_table=(f'<h3 style="font-size:15px;margin:22px 0 8px;color:#0f172a">Where it went</h3><table style="width:100%;border-collapse:collapse;font-size:14px">'
+               f'<tr><th style="text-align:left;padding:7px 10px;color:#64748b;font-size:12px">Category</th><th style="text-align:right;padding:7px 10px;color:#64748b;font-size:12px">Spent</th>'
+               f'<th style="text-align:right;padding:7px 10px;color:#64748b;font-size:12px">vs {pm:%b}</th></tr>{rows}</table>') if rows else ""
+    big="".join(f'<li style="margin:4px 0">{escape((d or c)[:40])} · <b>{euro(a)}</b> <span style="color:#94a3b8">({as_date(dt):%d %b}, {escape(c)})</span></li>'
+                for dt, a, c, d in s["big"])
+    big_html=f'<h3 style="font-size:15px;margin:22px 0 8px;color:#0f172a">Biggest expenses</h3><ul style="margin:0;padding-left:20px;font-size:14px">{big}</ul>' if big else ""
+    wealth=""
+    w, wp=s["w_now"], s["w_prev"]
+    if w:
+        def line(label, key):
+            cur_v=w[key]
+            if cur_v is None: return ""
+            ch=""
+            if wp and wp.get(key) is not None:
+                dv=cur_v-wp[key]; p=pct_change(cur_v, wp[key])
+                col="#16a34a" if dv>0 else "#dc2626" if dv<0 else "#64748b"
+                ch=f'<span style="color:{col};font-weight:600">{signed_euro(dv)}{f" ({p:+.1f}%)" if p is not None else ""}</span>'
+            return (f'<tr><td style="padding:7px 10px;border-bottom:1px solid #f1f5f9">{label}</td>'
+                    f'<td style="padding:7px 10px;border-bottom:1px solid #f1f5f9;text-align:right;font-weight:600">{euro(cur_v)}</td>'
+                    f'<td style="padding:7px 10px;border-bottom:1px solid #f1f5f9;text-align:right">{ch}</td></tr>')
+        wealth=(f'<h3 style="font-size:15px;margin:22px 0 8px;color:#0f172a">Wealth · snapshot of {w["date"]:%d %b}</h3>'
+                f'<table style="width:100%;border-collapse:collapse;font-size:14px">{line("Net worth","nw")}{line("Cash","cash")}{line("Investments","inv")}</table>')
+    else:
+        wealth=('<p style="font-size:13px;color:#94a3b8;margin:22px 0 0">No wealth snapshot was saved this month, '
+                'so there is no net worth change to show.</p>')
+    return (f'<div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;max-width:720px;margin:0 auto;color:#0f172a">'
+            f'<h2 style="font-size:22px;margin:0 0 4px">🗓️ {month:%B %Y} summary</h2>'
+            f'<div style="font-size:13px;color:#64748b;margin-bottom:10px">{cur["count"]} transactions · compared with {pm:%B %Y}</div>'
+            f'<table style="width:100%;border-collapse:collapse;border:0"><tr style="border:0">{tiles}</tr></table>'
+            f'<h3 style="font-size:15px;margin:22px 0 8px;color:#0f172a">Highlights</h3><ul style="margin:0;padding-left:20px;font-size:14px;line-height:1.5">{hl}</ul>'
+            f'{cat_table}{big_html}{wealth}</div>')
+
+def email_configured():
+    return bool(get_secret("SMTP_USER") and get_secret("SMTP_PASSWORD"))
+
+def send_summary_email(month):
+    """Emails the summary using the SMTP_* secrets. Returns None on success, or the error text."""
+    import smtplib
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+    user=get_secret("SMTP_USER"); to=get_secret("SUMMARY_EMAIL") or user
+    msg=MIMEMultipart("alternative")
+    msg["Subject"]=f"Finance OS · your {month:%B %Y} summary"
+    msg["From"]=user; msg["To"]=to
+    msg.attach(MIMEText(re.sub(r"<[^>]+>", " ", " ".join(summary_highlights(summary_data(month)))), "plain", "utf-8"))
+    msg.attach(MIMEText(f'<html><body style="background:#f8fafc;padding:24px">{summary_html(month)}</body></html>', "html", "utf-8"))
+    try:
+        with smtplib.SMTP(get_secret("SMTP_HOST") or "smtp.gmail.com", int(get_secret("SMTP_PORT") or 587), timeout=20) as srv:
+            srv.starttls(); srv.login(user, get_secret("SMTP_PASSWORD")); srv.sendmail(user, [to], msg.as_string())
+        return None
+    except Exception as e:
+        return str(e)
+
+def auto_email_summary():
+    """Once a month: the first time the app is opened after the month ends, email last month's summary."""
+    if not email_configured(): return
+    ensure_net_worth_items()
+    last=add_months(date.today().replace(day=1), -1)
+    tag=f"{last:%Y-%m}"
+    row=fetch_one("SELECT value FROM app_meta WHERE key='summary_emailed'")
+    if row and row[0]>=tag: return
+    if tx_totals(last, add_months(last, 1))["count"]==0: return
+    execute("INSERT INTO app_meta(key,value) VALUES ('summary_emailed',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [tag])
+    if send_summary_email(last) is None:
+        st.toast(f"📧 Your {last:%B} summary was emailed to you")
+
+def summary_block(month, key):
+    st.markdown(summary_html(month), unsafe_allow_html=True)
+    st.write("")
+    c1, c2, _=st.columns([1, 1, 2])
+    c1.download_button("⬇️ Download", f'<html><head><meta charset="utf-8"><title>{month:%B %Y} summary</title></head>'
+                       f'<body style="background:#f8fafc;padding:24px">{summary_html(month)}</body></html>'.encode("utf-8"),
+                       file_name=f"summary_{month:%Y-%m}.html", mime="text/html", key=f"dl_{key}", width="stretch")
+    if email_configured():
+        if c2.button("📧 Email it to me", key=f"em_{key}", width="stretch"):
+            err=send_summary_email(month)
+            st.toast("Sent ✅" if err is None else f"Couldn't send: {err}")
+    else:
+        c2.caption("To get this by email, add SMTP_USER and SMTP_PASSWORD to your Streamlit secrets.")
 
 PIE_COLORS=["#16a34a","#2563eb","#0891b2","#d97706","#dc2626","#7c3aed","#0f766e","#db2777","#64748b","#ca8a04"]
 
@@ -673,6 +923,10 @@ with st.sidebar:
             if n: st.toast(f"🔁 Added {n} recurring expense(s) that were due")
         except Exception:
             pass
+        try:
+            auto_email_summary()
+        except Exception:
+            pass
     st.caption(f"📅 {date.today():%A %d %B %Y}")
     if get_secret("APP_PASSWORD") and st.button("Log out", width="stretch"):
         st.session_state.authenticated=False; st.rerun()
@@ -713,6 +967,9 @@ if page=="🏠 Dashboard":
     else:
         kpi(k5, "💎 Net worth", 0, sub="Add a snapshot in Wealth", accent="#0f172a", text="—")
     st.write("")
+    if tx_totals(pm, MONTH_START)["count"]:
+        with st.expander(f"🗓️ Your {pm:%B %Y} summary", expanded=TODAY.day<=7):
+            summary_block(pm, "dash")
 
     left, right=st.columns([2, 1], gap="large")
     with left:
@@ -770,327 +1027,400 @@ elif page=="📝 Data Entry":
 
     # ---------- quick add ----------
     with tab_quick:
-        left, right=st.columns(2, gap="large")
-        with left:
-            card("💬 Just type it")
-            st.caption("e.g. *Woolworths 54,20 ieri* · *Stipendio 2.000 oggi* · *Netflix 15.99 12/10*. "
-                       "Check the category, then save.")
-            if st.session_state.pop("nl_clear", False):
-                st.session_state.nl_text=""
-                st.session_state.nl_sig=""
-            nl=st.text_input("Describe the transaction", key="nl_text", label_visibility="collapsed",
-                             placeholder="Woolworths 54,20 ieri")
-            parsed=None
-            if nl.strip():
-                try:
-                    parsed=parse_natural_language(nl)
-                    parsed["description"]=clean_nl_description(nl)
-                    parsed["category"]=smart_category(parsed["description"], parsed["transaction_type"], parsed["category"])[0]
-                except ValueError as e:
-                    st.warning(str(e))
-            if parsed:
-                sig=f"{parsed['transaction_date']}|{parsed['amount']}|{parsed['transaction_type']}|{parsed['category']}|{parsed['description']}"
-                if st.session_state.get("nl_sig")!=sig:
-                    st.session_state.nl_sig=sig
-                    st.session_state.nl_date=parsed["transaction_date"]
-                    st.session_state.nl_amount=float(parsed["amount"])
-                    st.session_state.nl_type=parsed["transaction_type"]
-                    st.session_state.nl_desc=parsed["description"]
-                    st.session_state.nl_cat=parsed["category"]
-                with st.container(border=True):
-                    c1,c2,c3=st.columns(3)
-                    d=c1.date_input("Date", key="nl_date", format="DD/MM/YYYY")
-                    a=c2.number_input("Amount (€)", min_value=0.01, step=0.01, key="nl_amount")
-                    typ=c3.selectbox("Type", ["Expense","Income"], key="nl_type")
-                    cats=categories_for(typ)
-                    if st.session_state.get("nl_cat") not in cats:
-                        st.session_state.nl_cat=cats[0]
-                    c4,c5=st.columns(2)
-                    cat=c4.selectbox("Category", cats, key="nl_cat")
-                    desc=c5.text_input("Description", key="nl_desc")
-                    if st.button("Save", type="primary", key="nl_save", width="stretch"):
+        @st.fragment
+        def quick_tab():
+            left, right=st.columns(2, gap="large")
+            with left:
+                card("💬 Just type it")
+                st.caption("e.g. *Woolworths 54,20 ieri* · *Stipendio 2.000 oggi* · *Netflix 15.99 12/10*. "
+                           "Check the category, then save.")
+                if st.session_state.pop("nl_clear", False):
+                    st.session_state.nl_text=""
+                    st.session_state.nl_sig=""
+                nl=st.text_input("Describe the transaction", key="nl_text", label_visibility="collapsed",
+                                 placeholder="Woolworths 54,20 ieri")
+                parsed=None
+                if nl.strip():
+                    try:
+                        parsed=parse_natural_language(nl)
+                        parsed["description"]=clean_nl_description(nl)
+                        parsed["category"]=smart_category(parsed["description"], parsed["transaction_type"], parsed["category"])[0]
+                    except ValueError as e:
+                        st.warning(str(e))
+                if parsed:
+                    sig=f"{parsed['transaction_date']}|{parsed['amount']}|{parsed['transaction_type']}|{parsed['category']}|{parsed['description']}"
+                    if st.session_state.get("nl_sig")!=sig:
+                        st.session_state.nl_sig=sig
+                        st.session_state.nl_date=parsed["transaction_date"]
+                        st.session_state.nl_amount=float(parsed["amount"])
+                        st.session_state.nl_type=parsed["transaction_type"]
+                        st.session_state.nl_desc=parsed["description"]
+                        st.session_state.nl_cat=parsed["category"]
+                    with st.container(border=True):
+                        c1,c2,c3=st.columns(3)
+                        d=c1.date_input("Date", key="nl_date", format="DD/MM/YYYY")
+                        a=c2.number_input("Amount (€)", min_value=0.01, step=0.01, key="nl_amount")
+                        typ=c3.selectbox("Type", ["Expense","Income"], key="nl_type")
+                        cats=categories_for(typ)
+                        if st.session_state.get("nl_cat") not in cats:
+                            st.session_state.nl_cat=cats[0]
+                        c4,c5=st.columns(2)
+                        cat=c4.selectbox("Category", cats, key="nl_cat")
+                        desc=c5.text_input("Description", key="nl_desc")
+                        if st.button("Save", type="primary", key="nl_save", width="stretch"):
+                            fp=transaction_fingerprint(d,a,cat,typ,desc)
+                            if insert_transaction(d,a,cat,typ,desc,"natural_language",fp):
+                                learn_category(desc, cat)
+                                st.session_state.nl_clear=True
+                                st.toast(f"Saved: {desc} {euro(a)} ✅")
+                                st.rerun()
+                            else:
+                                st.toast("Already saved — duplicate skipped")
+            with right:
+                card("✍️ Manual entry")
+                typ=st.segmented_control("Type", ["Expense","Income"], default="Expense", key="manual_typ") or "Expense"
+                cats=categories_for(typ)
+                if "manual_cat" in st.session_state and st.session_state.manual_cat not in cats:
+                    st.session_state.manual_cat=cats[0]
+                with st.form("manual", clear_on_submit=True, border=True):
+                    c1,c2=st.columns(2)
+                    d=c1.date_input("Date", TODAY, format="DD/MM/YYYY")
+                    a=c2.number_input("Amount (€)", min_value=0.01, step=0.01)
+                    c3,c4=st.columns(2)
+                    cat=c3.selectbox("Category", cats, key="manual_cat")
+                    desc=c4.text_input("Description", placeholder="Woolworths")
+                    if st.form_submit_button("Save", type="primary", width="stretch"):
                         fp=transaction_fingerprint(d,a,cat,typ,desc)
-                        if insert_transaction(d,a,cat,typ,desc,"natural_language",fp):
+                        if insert_transaction(d,a,cat,typ,desc,"manual",fp):
                             learn_category(desc, cat)
-                            st.session_state.nl_clear=True
-                            st.toast(f"Saved: {desc} {euro(a)} ✅")
+                            st.toast(f"Saved: {desc or cat} {euro(a)} ✅")
                             st.rerun()
                         else:
                             st.toast("Already saved — duplicate skipped")
-        with right:
-            card("✍️ Manual entry")
-            typ=st.segmented_control("Type", ["Expense","Income"], default="Expense", key="manual_typ") or "Expense"
-            cats=categories_for(typ)
-            if "manual_cat" in st.session_state and st.session_state.manual_cat not in cats:
-                st.session_state.manual_cat=cats[0]
-            with st.form("manual", clear_on_submit=True, border=True):
-                c1,c2=st.columns(2)
-                d=c1.date_input("Date", TODAY, format="DD/MM/YYYY")
-                a=c2.number_input("Amount (€)", min_value=0.01, step=0.01)
-                c3,c4=st.columns(2)
-                cat=c3.selectbox("Category", cats, key="manual_cat")
-                desc=c4.text_input("Description", placeholder="Woolworths")
-                if st.form_submit_button("Save", type="primary", width="stretch"):
-                    fp=transaction_fingerprint(d,a,cat,typ,desc)
-                    if insert_transaction(d,a,cat,typ,desc,"manual",fp):
-                        learn_category(desc, cat)
-                        st.toast(f"Saved: {desc or cat} {euro(a)} ✅")
-                    else:
-                        st.toast("Already saved — duplicate skipped")
-        card("🕒 Last added")
-        st.markdown(tx_rows_html(_q("""SELECT transaction_date, amount, category, transaction_type, description
-            FROM transactions ORDER BY created_at DESC, id DESC LIMIT 5""")), unsafe_allow_html=True)
+            card("🕒 Last added")
+            st.markdown(tx_rows_html(_q("""SELECT transaction_date, amount, category, transaction_type, description
+                FROM transactions ORDER BY created_at DESC, id DESC LIMIT 5""")), unsafe_allow_html=True)
+        quick_tab()
 
     # ---------- import ----------
     with tab_import:
-        st.caption("Upload a screenshot from your banking app, a receipt photo, or a CSV export from your bank. "
-                   "Every transaction is categorised automatically — fix anything wrong before importing and the app "
-                   "remembers your choice for that merchant next time.")
-        src=st.segmented_control("Source", ["📸 Screenshot", "📄 CSV file"], default="📸 Screenshot", key="imp_src") or "📸 Screenshot"
-        def stage(rows, source):
-            for r in rows:
-                r["category"], r["how"]=smart_category(r["description"], r["transaction_type"], r.get("category"))
-            st.session_state.ocr_rows=rows
-            st.session_state.ocr_source=source
-            st.session_state.ocr_ver=st.session_state.get("ocr_ver", 0)+1
-        if src=="📸 Screenshot":
-            imgf=st.file_uploader("Upload screenshot", type=["png","jpg","jpeg","webp"], key="img_upload")
-            if imgf:
-                from PIL import Image
-                im=Image.open(imgf).convert("RGB")
-                c_img, c_btn=st.columns([1, 1])
-                c_img.image(im, width="stretch")
-                with c_btn:
+        @st.fragment
+        def import_tab():
+            st.caption("Upload screenshots from your banking app, a bill-splitting app like Splitwise, receipt photos, or a "
+                       "bank CSV export. Everything is categorised automatically, using what you chose for the same "
+                       "merchant in the past. Fix anything wrong before importing and it's remembered next time.")
+            src=st.segmented_control("Source", ["📸 Screenshots", "📄 CSV file"], default="📸 Screenshots", key="imp_src") or "📸 Screenshots"
+            def stage(batches, source):
+                """batches: one list of rows per file. Drops overlaps between files and flags rows already saved."""
+                memory=category_memory()
+                rows, seen=[], set()
+                for batch in batches:
+                    keys=[tx_key(r["transaction_date"], r["amount"], r.get("description")) for r in batch]
+                    for r, k in zip(batch, keys):
+                        if k in seen: continue          # same line visible in two overlapping screenshots
+                        r["category"], r["how"]=smart_category(r["description"], r["transaction_type"], r.get("category"), memory)
+                        rows.append(r)
+                    seen.update(keys)
+                if rows:
+                    index=saved_tx_index(min(r["transaction_date"] for r in rows), max(r["transaction_date"] for r in rows))
+                    for r in rows: r["dup"]=already_saved(r, index)
+                st.session_state.ocr_rows=rows
+                st.session_state.ocr_source=source
+                st.session_state.ocr_ver=st.session_state.get("ocr_ver", 0)+1
+                return rows
+            if src=="📸 Screenshots":
+                files=st.file_uploader("Upload screenshots", type=["png","jpg","jpeg","webp"], key="img_upload",
+                                       accept_multiple_files=True, help="You can select several screenshots at once.")
+                if files:
+                    from PIL import Image
+                    images=[Image.open(f).convert("RGB") for f in files]
+                    with st.expander(f"Preview ({len(images)} file{'s' if len(images)!=1 else ''})"):
+                        thumbs=st.columns(6)
+                        for i, im in enumerate(images[:12]):
+                            thumbs[i%6].image(im, width="stretch")
+                        if len(images)>12: st.caption(f"+ {len(images)-12} more")
                     if not get_secret("GEMINI_API_KEY"):
-                        st.info("Tip: add a GEMINI_API_KEY secret for much better reading and categorisation of bank screenshots.")
-                    if st.button("🔍 Scan screenshot", type="primary", key="scan_img", width="stretch"):
-                        with st.spinner("Reading transactions…"):
-                            rows, raw=extract_image_transactions(im)
-                            stage(rows, "image_ocr")
+                        st.caption("Tip: add a GEMINI_API_KEY secret for even better reading of unusual layouts.")
+                    if st.button(f"🔍 Scan {len(images)} screenshot{'s' if len(images)!=1 else ''}", type="primary",
+                                 key="scan_img", width="stretch"):
+                        batches, empty=[], []
+                        bar=st.progress(0.0, text="Reading transactions…")
+                        for i, (f, im) in enumerate(zip(files, images)):
+                            found, _=extract_image_transactions(im)
+                            batches.append(found)
+                            if not found: empty.append(f.name)
+                            bar.progress((i+1)/len(images), text=f"Reading transactions… {i+1}/{len(images)}")
+                        bar.empty()
+                        rows=stage(batches, "image_ocr")
                         if rows: st.toast(f"{len(rows)} transaction(s) found")
                         else: st.warning("No transactions recognised. Try a sharper screenshot, or add it from Quick add.")
-        else:
-            csvf=st.file_uploader("Upload CSV", type=["csv","txt"], key="csv_upload",
-                                  help="Needs at least a date and an amount column. Negative amounts are treated as expenses.")
-            if csvf and st.button("📄 Read CSV", type="primary", key="read_csv"):
-                try:
-                    rows=parse_csv_transactions(csvf.getvalue())
-                    stage(rows, "csv")
-                    st.toast(f"{len(rows)} transaction(s) found")
-                except ValueError as e:
-                    st.error(str(e))
-        if st.session_state.get("ocr_rows"):
-            card("Review & import")
-            rows=st.session_state.ocr_rows
-            df=pd.DataFrame([{
-                "Import": True,
-                "Date": x["transaction_date"],
-                "Description": x.get("description") or "Bank/card transaction",
-                "Amount": float(x["amount"]),
-                "Type": x.get("transaction_type") or "Expense",
-                "Category": x.get("category") or "Other",
-                "": "🧠 learned" if x.get("how")=="learned" else "",
-            } for x in rows])
-            edited=st.data_editor(
-                df, key=f"ocr_editor_{st.session_state.get('ocr_ver', 0)}", hide_index=True, width="stretch",
-                num_rows="fixed", disabled=[""],
-                column_config={
-                    "Import": st.column_config.CheckboxColumn(width="small"),
-                    "Date": st.column_config.DateColumn(format="DD/MM/YYYY", width="small"),
-                    "Description": st.column_config.TextColumn(width="large"),
-                    "Amount": st.column_config.NumberColumn(min_value=0.01, step=0.01, format="€ %.2f", width="small"),
-                    "Type": st.column_config.SelectboxColumn(options=["Expense", "Income"], width="small"),
-                    "Category": st.column_config.SelectboxColumn(options=CATEGORIES, width="medium"),
-                    "": st.column_config.TextColumn(width="small"),
-                })
-            chosen=edited[edited["Import"]==True]
-            st.caption(f"{len(chosen)} selected · expenses {euro(chosen.loc[chosen['Type']=='Expense','Amount'].sum())} · "
-                       f"income {euro(chosen.loc[chosen['Type']=='Income','Amount'].sum())}")
-            b1, b2=st.columns([3, 1])
-            if b1.button("✅ Import selected", type="primary", key="import_ocr", width="stretch"):
-                ins=dup=0
-                for r in chosen.to_dict("records"):
-                    d=as_date(r["Date"]); amount=float(r["Amount"]); typ=r["Type"] or "Expense"
-                    desc=str(r["Description"] or "").strip()
-                    cat=r["Category"] if r["Category"] in categories_for(typ) else auto_categorize(desc, typ)
-                    fp=transaction_fingerprint(d, amount, cat, typ, desc)
-                    if insert_transaction(d, amount, cat, typ, desc, st.session_state.get("ocr_source", "image_ocr"), fp): ins+=1
-                    else: dup+=1
-                    learn_category(desc, cat)
-                st.session_state.ocr_rows=[]
-                st.toast(f"Imported {ins}" + (f" · skipped {dup} duplicate(s)" if dup else "") + " ✅")
-                st.rerun()
-            if b2.button("Discard", key="discard_ocr", width="stretch"):
-                st.session_state.ocr_rows=[]
-                st.rerun()
+                        if rows and empty: st.warning("Nothing readable in: " + ", ".join(empty))
+            else:
+                csvf=st.file_uploader("Upload CSV", type=["csv","txt"], key="csv_upload",
+                                      help="Needs at least a date and an amount column. Negative amounts are treated as expenses.")
+                if csvf and st.button("📄 Read CSV", type="primary", key="read_csv"):
+                    try:
+                        rows=stage([parse_csv_transactions(csvf.getvalue())], "csv")
+                        st.toast(f"{len(rows)} transaction(s) found")
+                    except ValueError as e:
+                        st.error(str(e))
+            if st.session_state.get("ocr_rows"):
+                card("Review & import")
+                rows=st.session_state.ocr_rows
+                ndup=sum(1 for x in rows if x.get("dup"))
+                if ndup:
+                    st.info(f"{ndup} of these look like they're already saved, so they're unticked. Tick them if they are genuinely new.")
+                df=pd.DataFrame([{
+                    "Import": not x.get("dup"),
+                    "Date": x["transaction_date"],
+                    "Description": x.get("description") or "Bank/card transaction",
+                    "Amount": float(x["amount"]),
+                    "Type": x.get("transaction_type") or "Expense",
+                    "Category": x.get("category") or "Other",
+                    "Note": "⚠️ already saved" if x.get("dup") else "🧠 from your history" if x.get("how")=="learned" else "",
+                } for x in rows])
+                edited=st.data_editor(
+                    df, key=f"ocr_editor_{st.session_state.get('ocr_ver', 0)}", hide_index=True, width="stretch",
+                    num_rows="fixed", disabled=["Note"],
+                    column_config={
+                        "Import": st.column_config.CheckboxColumn(width="small"),
+                        "Date": st.column_config.DateColumn(format="DD/MM/YYYY", width="small"),
+                        "Description": st.column_config.TextColumn(width="large"),
+                        "Amount": st.column_config.NumberColumn(min_value=0.01, step=0.01, format="€ %.2f", width="small"),
+                        "Type": st.column_config.SelectboxColumn(options=["Expense", "Income"], width="small"),
+                        "Category": st.column_config.SelectboxColumn(options=CATEGORIES, width="medium"),
+                        "Note": st.column_config.TextColumn("", width="medium"),
+                    })
+                chosen=edited[edited["Import"]==True]
+                st.caption(f"{len(chosen)} selected · expenses {euro(chosen.loc[chosen['Type']=='Expense','Amount'].sum())} · "
+                           f"income {euro(chosen.loc[chosen['Type']=='Income','Amount'].sum())}")
+                b1, b2=st.columns([3, 1])
+                if b1.button("✅ Import selected", type="primary", key="import_ocr", width="stretch"):
+                    ins=dup=0
+                    for r in chosen.to_dict("records"):
+                        d=as_date(r["Date"]); amount=float(r["Amount"]); typ=r["Type"] or "Expense"
+                        desc=str(r["Description"] or "").strip()
+                        cat=r["Category"] if r["Category"] in categories_for(typ) else auto_categorize(desc, typ)
+                        fp=transaction_fingerprint(d, amount, cat, typ, desc)
+                        if str(r["Note"]).startswith("⚠️"):
+                            fp+=":"+uuid.uuid4().hex[:8]        # you ticked a look-alike on purpose
+                        if insert_transaction(d, amount, cat, typ, desc, st.session_state.get("ocr_source", "image_ocr"), fp): ins+=1
+                        else: dup+=1
+                        learn_category(desc, cat)
+                    st.session_state.ocr_rows=[]
+                    st.toast(f"Imported {ins}" + (f" · skipped {dup} duplicate(s)" if dup else "") + " ✅")
+                    st.rerun()
+                if b2.button("Discard", key="discard_ocr", width="stretch"):
+                    st.session_state.ocr_rows=[]
+                    st.rerun()
+        import_tab()
 
     # ---------- recurring ----------
     with tab_rec:
-        st.caption("Recurring expenses are added automatically when they fall due (checked each time you open the app).")
-        recs=_q("SELECT id,name,amount,category,frequency,next_due_date,active FROM recurring_expenses ORDER BY active DESC, next_due_date")
-        per_month={"Weekly": 52/12, "Monthly": 1, "Quarterly": 1/3, "Yearly": 1/12}
-        monthly=sum(float(r[2])*per_month[r[4]] for r in recs if r[6])
-        m1,m2,m3=st.columns(3)
-        kpi(m1, "Monthly cost", monthly, sub=f"{sum(1 for r in recs if r[6])} active", accent="#7c3aed")
-        kpi(m2, "Yearly cost", monthly*12, sub="All active recurring", accent="#7c3aed")
-        nxt=next((r for r in recs if r[6]), None)
-        kpi(m3, "Next payment", float(nxt[2]) if nxt else 0, text=None if nxt else "—",
-            sub=f"{nxt[1]} · {as_date(nxt[5]):%d %b}" if nxt else "Nothing scheduled", accent="#7c3aed")
-        st.write("")
-        if recs:
-            rv=st.session_state.setdefault("rec_ver", 0)
-            rdf=pd.DataFrame([{"id": r[0], "Name": r[1], "Amount": float(r[2]), "Category": r[3], "Frequency": r[4],
-                               "Next due": as_date(r[5]), "Active": bool(r[6]), "Delete": False} for r in recs]).set_index("id")
-            red=st.data_editor(rdf, key=f"rec_editor_{rv}", hide_index=True, width="stretch", num_rows="fixed",
-                column_config={
-                    "Amount": st.column_config.NumberColumn(min_value=0.01, format="€ %.2f"),
-                    "Category": st.column_config.SelectboxColumn(options=EXPENSE_CATEGORIES),
-                    "Frequency": st.column_config.SelectboxColumn(options=["Weekly","Monthly","Quarterly","Yearly"]),
-                    "Next due": st.column_config.DateColumn(format="DD/MM/YYYY"),
-                    "Active": st.column_config.CheckboxColumn(width="small"),
-                    "Delete": st.column_config.CheckboxColumn("🗑️", width="small"),
-                })
-            c1, c2=st.columns([3, 1])
-            if c1.button("💾 Save changes", type="primary", key="rec_save", width="stretch"):
-                changed=0
-                for rid, r in red.iterrows():
-                    o=rdf.loc[rid]
-                    if r["Delete"]:
-                        delete_recurring_expense(int(rid)); changed+=1
-                    elif any(r[k]!=o[k] for k in ("Name","Amount","Category","Frequency","Next due","Active")):
-                        execute("""UPDATE recurring_expenses SET name=?,amount=?,category=?,frequency=?,next_due_date=?,active=?
-                                   WHERE id=?""", [r["Name"], float(r["Amount"]), r["Category"], r["Frequency"],
-                                                   as_date(r["Next due"]), bool(r["Active"]), int(rid)])
-                        changed+=1
-                st.session_state.rec_ver=rv+1
-                st.toast(f"{changed} change(s) saved ✅" if changed else "Nothing changed")
-                st.rerun()
-            if c2.button("▶️ Run due now", key="rec_run", width="stretch"):
-                n=process_due_recurring(TODAY)
-                st.toast(f"{n} transaction(s) created")
-                st.rerun()
-        with st.expander("➕ Add a recurring expense", expanded=not recs):
-            with st.form("rec", clear_on_submit=True, border=False):
-                c1,c2=st.columns(2)
-                name=c1.text_input("Name", placeholder="Netflix")
-                ra=c2.number_input("Amount (€)", min_value=0.01, step=0.01)
-                rc=c1.selectbox("Category", EXPENSE_CATEGORIES, index=EXPENSE_CATEGORIES.index("Subscriptions"), key="rc")
-                freq=c2.selectbox("Frequency", ["Weekly","Monthly","Quarterly","Yearly"], index=1)
-                nd=st.date_input("Next due", TODAY, format="DD/MM/YYYY")
-                if st.form_submit_button("Add", type="primary"):
-                    if not name.strip():
-                        st.error("Give it a name.")
-                    else:
-                        execute("INSERT INTO recurring_expenses(name,amount,category,frequency,next_due_date) VALUES(?,?,?,?,?)",
-                                [name.strip(),ra,rc,freq,nd])
-                        st.toast("Recurring expense added ✅")
+        @st.fragment
+        def recurring_tab():
+            st.caption("Recurring expenses are added automatically when they fall due (checked each time you open the app).")
+            recs=_q("SELECT id,name,amount,category,frequency,next_due_date,active FROM recurring_expenses ORDER BY active DESC, next_due_date")
+            per_month={"Weekly": 52/12, "Monthly": 1, "Quarterly": 1/3, "Yearly": 1/12}
+            monthly=sum(float(r[2])*per_month[r[4]] for r in recs if r[6])
+            m1,m2,m3=st.columns(3)
+            kpi(m1, "Monthly cost", monthly, sub=f"{sum(1 for r in recs if r[6])} active", accent="#7c3aed")
+            kpi(m2, "Yearly cost", monthly*12, sub="All active recurring", accent="#7c3aed")
+            nxt=next((r for r in recs if r[6]), None)
+            kpi(m3, "Next payment", float(nxt[2]) if nxt else 0, text=None if nxt else "—",
+                sub=f"{nxt[1]} · {as_date(nxt[5]):%d %b}" if nxt else "Nothing scheduled", accent="#7c3aed")
+            st.write("")
+            sugg=recurring_suggestions()
+            if sugg:
+                with st.container(border=True):
+                    card(f"💡 {len(sugg)} payment{'s' if len(sugg)!=1 else ''} that look like subscriptions")
+                    st.caption("Found in your transactions: same merchant about once a month for a similar amount. "
+                               "Tick the ones you want, then add them or hide them for good.")
+                    sv=st.session_state.setdefault("sugg_ver", 0)
+                    sdf=pd.DataFrame([{"Select": True, **{k: x[k] for k in ("Name","Amount","Category","Seen","Next due")}} for x in sugg])
+                    sed=st.data_editor(sdf, key=f"sugg_editor_{sv}", hide_index=True, width="stretch", num_rows="fixed",
+                                       disabled=["Seen"],
+                                       column_config={
+                                           "Select": st.column_config.CheckboxColumn(width="small"),
+                                           "Amount": st.column_config.NumberColumn(min_value=0.01, format="€ %.2f"),
+                                           "Category": st.column_config.SelectboxColumn(options=EXPENSE_CATEGORIES),
+                                           "Next due": st.column_config.DateColumn(format="DD/MM/YYYY"),
+                                       })
+                    picked=[(sugg[i]["key"], r) for i, r in enumerate(sed.to_dict("records")) if r["Select"]]
+                    s1, s2=st.columns([3, 1])
+                    if s1.button(f"➕ Add {len(picked)} as recurring", type="primary", key="sugg_add", width="stretch", disabled=not picked):
+                        for key, r in picked:
+                            execute("INSERT INTO recurring_expenses(name,amount,category,frequency,next_due_date) VALUES(?,?,?,?,?)",
+                                    [str(r["Name"]).strip() or key.title(), float(r["Amount"]), r["Category"], "Monthly", as_date(r["Next due"])])
+                        st.session_state.sugg_ver=sv+1
+                        st.toast(f"{len(picked)} recurring expense(s) added ✅")
                         st.rerun()
+                    if s2.button("Hide selected", key="sugg_hide", width="stretch", disabled=not picked):
+                        for key, _ in picked:
+                            execute("INSERT INTO recurring_ignored(merchant) VALUES(?) ON CONFLICT DO NOTHING", [key])
+                        st.session_state.sugg_ver=sv+1
+                        st.rerun()
+            if recs:
+                rv=st.session_state.setdefault("rec_ver", 0)
+                rdf=pd.DataFrame([{"id": r[0], "Name": r[1], "Amount": float(r[2]), "Category": r[3], "Frequency": r[4],
+                                   "Next due": as_date(r[5]), "Active": bool(r[6]), "Delete": False} for r in recs]).set_index("id")
+                red=st.data_editor(rdf, key=f"rec_editor_{rv}", hide_index=True, width="stretch", num_rows="fixed",
+                    column_config={
+                        "Amount": st.column_config.NumberColumn(min_value=0.01, format="€ %.2f"),
+                        "Category": st.column_config.SelectboxColumn(options=EXPENSE_CATEGORIES),
+                        "Frequency": st.column_config.SelectboxColumn(options=["Weekly","Monthly","Quarterly","Yearly"]),
+                        "Next due": st.column_config.DateColumn(format="DD/MM/YYYY"),
+                        "Active": st.column_config.CheckboxColumn(width="small"),
+                        "Delete": st.column_config.CheckboxColumn("🗑️", width="small"),
+                    })
+                c1, c2=st.columns([3, 1])
+                if c1.button("💾 Save changes", type="primary", key="rec_save", width="stretch"):
+                    changed=0
+                    for rid, r in red.iterrows():
+                        o=rdf.loc[rid]
+                        if r["Delete"]:
+                            delete_recurring_expense(int(rid)); changed+=1
+                        elif any(r[k]!=o[k] for k in ("Name","Amount","Category","Frequency","Next due","Active")):
+                            execute("""UPDATE recurring_expenses SET name=?,amount=?,category=?,frequency=?,next_due_date=?,active=?
+                                       WHERE id=?""", [r["Name"], float(r["Amount"]), r["Category"], r["Frequency"],
+                                                       as_date(r["Next due"]), bool(r["Active"]), int(rid)])
+                            changed+=1
+                    st.session_state.rec_ver=rv+1
+                    st.toast(f"{changed} change(s) saved ✅" if changed else "Nothing changed")
+                    st.rerun()
+                if c2.button("▶️ Run due now", key="rec_run", width="stretch"):
+                    n=process_due_recurring(TODAY)
+                    st.toast(f"{n} transaction(s) created")
+                    st.rerun()
+            with st.expander("➕ Add a recurring expense", expanded=not recs and not sugg):
+                with st.form("rec", clear_on_submit=True, border=False):
+                    c1,c2=st.columns(2)
+                    name=c1.text_input("Name", placeholder="Netflix")
+                    ra=c2.number_input("Amount (€)", min_value=0.01, step=0.01)
+                    rc=c1.selectbox("Category", EXPENSE_CATEGORIES, index=EXPENSE_CATEGORIES.index("Subscriptions"), key="rc")
+                    freq=c2.selectbox("Frequency", ["Weekly","Monthly","Quarterly","Yearly"], index=1)
+                    nd=st.date_input("Next due", TODAY, format="DD/MM/YYYY")
+                    if st.form_submit_button("Add", type="primary"):
+                        if not name.strip():
+                            st.error("Give it a name.")
+                        else:
+                            execute("INSERT INTO recurring_expenses(name,amount,category,frequency,next_due_date) VALUES(?,?,?,?,?)",
+                                    [name.strip(),ra,rc,freq,nd])
+                            st.toast("Recurring expense added ✅")
+                            st.rerun()
+        recurring_tab()
 
     # ---------- budgets ----------
     with tab_bud:
-        st.caption("Set a monthly limit per category (leave 0 for no budget). Progress shows on the Dashboard.")
-        bv=st.session_state.setdefault("bud_ver", 0)
-        nm=add_months(MONTH_START, 1)
-        spent=cat_totals(MONTH_START, nm)
-        avg3={c: v/3 for c, v in cat_totals(add_months(MONTH_START, -3), MONTH_START).items()}
-        budgets=get_budgets()
-        suggest=st.session_state.get("bud_suggest_ver")==bv
-        def suggested(c):
-            if budgets.get(c): return budgets[c]
-            if suggest and avg3.get(c): return float(-(-avg3[c]//10)*10)   # round up to €10
-            return 0.0
-        bdf=pd.DataFrame([{"Category": c, "Monthly budget": suggested(c), "Spent this month": spent.get(c, 0.0),
-                           "3-month average": avg3.get(c, 0.0)} for c in EXPENSE_CATEGORIES if c not in NON_SPENDING])
-        bed=st.data_editor(bdf, key=f"bud_editor_{bv}", hide_index=True, width="stretch", num_rows="fixed",
-                           disabled=["Category", "Spent this month", "3-month average"],
-                           column_config={
-                               "Monthly budget": st.column_config.NumberColumn(min_value=0.0, step=10.0, format="€ %.2f"),
-                               "Spent this month": st.column_config.NumberColumn(format="€ %.2f"),
-                               "3-month average": st.column_config.NumberColumn(format="€ %.2f"),
-                           })
-        tot=float(bed["Monthly budget"].fillna(0).sum())
-        st.caption(f"Total monthly budget: **{euro(tot)}**")
-        c1, c2=st.columns([3, 1])
-        if c1.button("💾 Save budgets", type="primary", key="bud_save", width="stretch"):
-            for r in bed.to_dict("records"):
-                lim=float(r["Monthly budget"] or 0)
-                if lim>0:
-                    execute("INSERT INTO budgets(category,monthly_limit) VALUES(?,?) ON CONFLICT(category) DO UPDATE SET monthly_limit=excluded.monthly_limit",
-                            [r["Category"], lim])
-                else:
-                    execute("DELETE FROM budgets WHERE category=?", [r["Category"]])
-            st.session_state.bud_ver=bv+1
-            st.toast("Budgets saved ✅")
-            st.rerun()
-        if c2.button("✨ Suggest from average", key="bud_suggest_btn", width="stretch",
-                     help="Fills empty budgets with your 3-month average, rounded up to €10. Review, then save."):
-            st.session_state.bud_suggest_ver=bv+1
-            st.session_state.bud_ver=bv+1
-            st.rerun()
+        @st.fragment
+        def budgets_tab():
+            st.caption("Set a monthly limit per category (leave 0 for no budget). Progress shows on the Dashboard.")
+            bv=st.session_state.setdefault("bud_ver", 0)
+            nm=add_months(MONTH_START, 1)
+            spent=cat_totals(MONTH_START, nm)
+            avg3={c: v/3 for c, v in cat_totals(add_months(MONTH_START, -3), MONTH_START).items()}
+            budgets=get_budgets()
+            suggest=st.session_state.get("bud_suggest_ver")==bv
+            def suggested(c):
+                if budgets.get(c): return budgets[c]
+                if suggest and avg3.get(c): return float(-(-avg3[c]//10)*10)   # round up to €10
+                return 0.0
+            bdf=pd.DataFrame([{"Category": c, "Monthly budget": suggested(c), "Spent this month": spent.get(c, 0.0),
+                               "3-month average": avg3.get(c, 0.0)} for c in EXPENSE_CATEGORIES if c not in NON_SPENDING])
+            bed=st.data_editor(bdf, key=f"bud_editor_{bv}", hide_index=True, width="stretch", num_rows="fixed",
+                               disabled=["Category", "Spent this month", "3-month average"],
+                               column_config={
+                                   "Monthly budget": st.column_config.NumberColumn(min_value=0.0, step=10.0, format="€ %.2f"),
+                                   "Spent this month": st.column_config.NumberColumn(format="€ %.2f"),
+                                   "3-month average": st.column_config.NumberColumn(format="€ %.2f"),
+                               })
+            tot=float(bed["Monthly budget"].fillna(0).sum())
+            st.caption(f"Total monthly budget: **{euro(tot)}**")
+            c1, c2=st.columns([3, 1])
+            if c1.button("💾 Save budgets", type="primary", key="bud_save", width="stretch"):
+                for r in bed.to_dict("records"):
+                    lim=float(r["Monthly budget"] or 0)
+                    if lim>0:
+                        execute("INSERT INTO budgets(category,monthly_limit) VALUES(?,?) ON CONFLICT(category) DO UPDATE SET monthly_limit=excluded.monthly_limit",
+                                [r["Category"], lim])
+                    else:
+                        execute("DELETE FROM budgets WHERE category=?", [r["Category"]])
+                st.session_state.bud_ver=bv+1
+                st.toast("Budgets saved ✅")
+                st.rerun()
+            if c2.button("✨ Suggest from average", key="bud_suggest_btn", width="stretch",
+                         help="Fills empty budgets with your 3-month average, rounded up to €10. Review, then save."):
+                st.session_state.bud_suggest_ver=bv+1
+                st.session_state.bud_ver=bv+1
+                st.rerun()
+        budgets_tab()
 
     # ---------- transactions ----------
     with tab_tx:
-        months=tx_months()
-        f1,f2,f3,f4=st.columns([1.2,1,1.2,2])
-        month=f1.selectbox("Month", ["All"]+months, key="txf_month",
-                           format_func=lambda v: "All months" if v=="All" else f"{v:%B %Y}")
-        typ_f=f2.selectbox("Type", ["All","Expense","Income"], key="txf_type")
-        cat_f=f3.selectbox("Category", ["All"]+CATEGORIES, key="txf_cat")
-        q=f4.text_input("Search", placeholder="Woolworths, rent, stipendio…", key="txf_q")
-        start=None if month=="All" else month
-        end=None if month=="All" else add_months(month, 1)
-        rows=_q("""
-            SELECT id, transaction_date, amount, category, transaction_type, description, source
-            FROM transactions
-            WHERE (? IS NULL OR transaction_date>=?) AND (? IS NULL OR transaction_date<?)
-              AND (? IS NULL OR transaction_type=?) AND (? IS NULL OR category=?)
-              AND (?='' OR lower(coalesce(description,'')) LIKE '%'||lower(?)||'%' OR lower(category) LIKE '%'||lower(?)||'%')
-            ORDER BY transaction_date DESC, id DESC LIMIT 1000
-        """, [start, start, end, end, None if typ_f=="All" else typ_f, None if typ_f=="All" else typ_f,
-              None if cat_f=="All" else cat_f, None if cat_f=="All" else cat_f, q or "", q or "", q or ""])
-        inc=sum(float(r[2]) for r in rows if r[4]=="Income")
-        exp=sum(float(r[2]) for r in rows if r[4]=="Expense" and r[3] not in NON_SPENDING)
-        invd=sum(float(r[2]) for r in rows if r[4]=="Expense" and r[3] in NON_SPENDING)
-        st.caption(f"**{len(rows)}** transaction{'s' if len(rows)!=1 else ''}"
-                   f"{' (latest 1000)' if len(rows)==1000 else ''} · in {euro(inc)} · spent {euro(exp)}"
-                   f"{f' · invested {euro(invd)}' if invd else ''} · saved {signed_euro(inc-exp)}")
-        if not rows:
-            st.info("No transactions for these filters.")
-        else:
-            tv=st.session_state.setdefault("tx_ver", 0)
-            tdf=pd.DataFrame([{"id": r[0], "Date": as_date(r[1]), "Description": r[5] or "", "Amount": float(r[2]),
-                               "Type": r[4], "Category": r[3], "Source": r[6] or "", "Delete": False} for r in rows]).set_index("id")
-            ted=st.data_editor(tdf, key=f"tx_editor_{tv}_{month}_{typ_f}_{cat_f}_{q}", hide_index=True, width="stretch",
-                               num_rows="fixed", disabled=["Source"], height=min(38+35*len(rows), 560),
-                               column_config={
-                                   "Date": st.column_config.DateColumn(format="DD/MM/YYYY", width="small"),
-                                   "Description": st.column_config.TextColumn(width="large"),
-                                   "Amount": st.column_config.NumberColumn(min_value=0.0, format="€ %.2f", width="small"),
-                                   "Type": st.column_config.SelectboxColumn(options=["Expense","Income"], width="small"),
-                                   "Category": st.column_config.SelectboxColumn(options=CATEGORIES, width="medium"),
-                                   "Source": st.column_config.TextColumn(width="small"),
-                                   "Delete": st.column_config.CheckboxColumn("🗑️", width="small"),
-                               })
-            st.caption("Edit any cell directly, tick 🗑️ to delete, then save.")
-            c1, c2=st.columns([3, 1])
-            if c1.button("💾 Save changes", type="primary", key="tx_save", width="stretch"):
-                upd=dele=0
-                for rid, r in ted.iterrows():
-                    o=tdf.loc[rid]
-                    if r["Delete"]:
-                        delete_transaction(int(rid)); dele+=1
-                    elif any(r[k]!=o[k] for k in ("Date","Description","Amount","Type","Category")):
-                        typ=r["Type"]; cat=r["Category"]
-                        if cat not in categories_for(typ): cat=auto_categorize(r["Description"], typ)
-                        update_transaction(int(rid), as_date(r["Date"]), float(r["Amount"]), cat, typ, r["Description"])
-                        if cat!=o["Category"]: learn_category(r["Description"], cat)
-                        upd+=1
-                st.session_state.tx_ver=tv+1
-                st.toast(f"Updated {upd} · deleted {dele} ✅" if upd or dele else "Nothing changed")
-                st.rerun()
-            c2.download_button("⬇️ Export CSV", tdf.drop(columns=["Delete"]).to_csv().encode("utf-8"),
-                               file_name=f"transactions_{'all' if month=='All' else f'{month:%Y-%m}'}.csv",
-                               mime="text/csv", width="stretch")
+        @st.fragment
+        def transactions_tab():
+            months=tx_months()
+            f1,f2,f3,f4=st.columns([1.2,1,1.2,2])
+            month=f1.selectbox("Month", ["All"]+months, key="txf_month",
+                               format_func=lambda v: "All months" if v=="All" else f"{v:%B %Y}")
+            typ_f=f2.selectbox("Type", ["All","Expense","Income"], key="txf_type")
+            cat_f=f3.selectbox("Category", ["All"]+CATEGORIES, key="txf_cat")
+            q=f4.text_input("Search", placeholder="Woolworths, rent, stipendio…", key="txf_q")
+            start=None if month=="All" else month
+            end=None if month=="All" else add_months(month, 1)
+            rows=_q("""
+                SELECT id, transaction_date, amount, category, transaction_type, description, source
+                FROM transactions
+                WHERE (? IS NULL OR transaction_date>=?) AND (? IS NULL OR transaction_date<?)
+                  AND (? IS NULL OR transaction_type=?) AND (? IS NULL OR category=?)
+                  AND (?='' OR lower(coalesce(description,'')) LIKE '%'||lower(?)||'%' OR lower(category) LIKE '%'||lower(?)||'%')
+                ORDER BY transaction_date DESC, id DESC LIMIT 1000
+            """, [start, start, end, end, None if typ_f=="All" else typ_f, None if typ_f=="All" else typ_f,
+                  None if cat_f=="All" else cat_f, None if cat_f=="All" else cat_f, q or "", q or "", q or ""])
+            inc=sum(float(r[2]) for r in rows if r[4]=="Income")
+            exp=sum(float(r[2]) for r in rows if r[4]=="Expense" and r[3] not in NON_SPENDING)
+            invd=sum(float(r[2]) for r in rows if r[4]=="Expense" and r[3] in NON_SPENDING)
+            st.caption(f"**{len(rows)}** transaction{'s' if len(rows)!=1 else ''}"
+                       f"{' (latest 1000)' if len(rows)==1000 else ''} · in {euro(inc)} · spent {euro(exp)}"
+                       f"{f' · invested {euro(invd)}' if invd else ''} · saved {signed_euro(inc-exp)}")
+            if not rows:
+                st.info("No transactions for these filters.")
+            else:
+                tv=st.session_state.setdefault("tx_ver", 0)
+                tdf=pd.DataFrame([{"id": r[0], "Date": as_date(r[1]), "Description": r[5] or "", "Amount": float(r[2]),
+                                   "Type": r[4], "Category": r[3], "Source": r[6] or "", "Delete": False} for r in rows]).set_index("id")
+                ted=st.data_editor(tdf, key=f"tx_editor_{tv}_{month}_{typ_f}_{cat_f}_{q}", hide_index=True, width="stretch",
+                                   num_rows="fixed", disabled=["Source"], height=min(38+35*len(rows), 560),
+                                   column_config={
+                                       "Date": st.column_config.DateColumn(format="DD/MM/YYYY", width="small"),
+                                       "Description": st.column_config.TextColumn(width="large"),
+                                       "Amount": st.column_config.NumberColumn(min_value=0.0, format="€ %.2f", width="small"),
+                                       "Type": st.column_config.SelectboxColumn(options=["Expense","Income"], width="small"),
+                                       "Category": st.column_config.SelectboxColumn(options=CATEGORIES, width="medium"),
+                                       "Source": st.column_config.TextColumn(width="small"),
+                                       "Delete": st.column_config.CheckboxColumn("🗑️", width="small"),
+                                   })
+                st.caption("Edit any cell directly, tick 🗑️ to delete, then save.")
+                c1, c2=st.columns([3, 1])
+                if c1.button("💾 Save changes", type="primary", key="tx_save", width="stretch"):
+                    upd=dele=0
+                    for rid, r in ted.iterrows():
+                        o=tdf.loc[rid]
+                        if r["Delete"]:
+                            delete_transaction(int(rid)); dele+=1
+                        elif any(r[k]!=o[k] for k in ("Date","Description","Amount","Type","Category")):
+                            typ=r["Type"]; cat=r["Category"]
+                            if cat not in categories_for(typ): cat=auto_categorize(r["Description"], typ)
+                            update_transaction(int(rid), as_date(r["Date"]), float(r["Amount"]), cat, typ, r["Description"])
+                            if cat!=o["Category"]: learn_category(r["Description"], cat)
+                            upd+=1
+                    st.session_state.tx_ver=tv+1
+                    st.toast(f"Updated {upd} · deleted {dele} ✅" if upd or dele else "Nothing changed")
+                    st.rerun()
+                c2.download_button("⬇️ Export CSV", tdf.drop(columns=["Delete"]).to_csv().encode("utf-8"),
+                                   file_name=f"transactions_{'all' if month=='All' else f'{month:%Y-%m}'}.csv",
+                                   mime="text/csv", width="stretch")
+        transactions_tab()
 
 # =====================================================================
 # REPORTS
@@ -1129,7 +1459,13 @@ elif page=="📊 Reports":
 
     cats=cat_totals(start, end); pcats=cat_totals(pstart, start)
     cats_all=cat_totals(start, end, include_investing=True)
-    t_sp, t_in, t_tr, t_ins=st.tabs(["🧾 Spending", "💵 Income", "📈 Trends", "🔎 Insights"])
+    t_sp, t_in, t_tr, t_ins, t_sum=st.tabs(["🧾 Spending", "💵 Income", "📈 Trends", "🔎 Insights", "🗓️ Monthly summary"])
+
+    with t_sum:
+        if mode=="Month":
+            summary_block(sel, "rep")
+        else:
+            st.info("Switch the period to **Month** to see that month's summary.")
 
     with t_sp:
         if not cats:
@@ -1572,7 +1908,7 @@ elif page=="💎 Wealth & Strategy":
 
     # ---------- paycheck router ----------
     with tab_router:
-        existing={r[0]:float(r[1]) for r in fetch_all("SELECT account_name,percentage FROM routing_rules")}
+        existing={r[0]:float(r[1]) for r in _q("SELECT account_name,percentage FROM routing_rules")}
         st.caption("Split each paycheck automatically. The three percentages must add up to 100%.")
         with st.form("routing"):
             c1,c2,c3=st.columns(3)

@@ -132,7 +132,9 @@ def _ensure_net_worth_items(con):
             )
 
 def execute(sql: str, params: Iterable[Any] | None = None):
-    return get_db().execute(sql, list(params) if params is not None else None)
+    # A separate cursor per query: sharing one connection lets two overlapping page loads
+    # read each other's results.
+    return get_db().cursor().execute(sql, list(params) if params is not None else None)
 
 def fetch_all(sql: str, params: Iterable[Any] | None = None) -> list[tuple]:
     return execute(sql, params).fetchall()

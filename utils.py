@@ -87,6 +87,15 @@ KEYWORD_CATEGORIES={
 "commsec":"Investing","stake":"Investing","raiz":"Investing","spaceship":"Investing","pearler":"Investing",
 "trading 212":"Investing","mexem":"Investing","interactive brokers":"Investing","vanguard":"Investing",
 "interest":"Other Income","refund":"Other Income","dividend":"Other Income",
+# everyday words used in shared-expense apps
+"dinner":"Dining Out","lunch":"Dining Out","breakfast":"Dining Out","brunch":"Dining Out","drinks":"Dining Out",
+"beer":"Dining Out","birra":"Dining Out","spritz":"Dining Out","cocktail":"Dining Out","kebab":"Dining Out",
+"piadina":"Dining Out","piadine":"Dining Out","panino":"Dining Out","panini":"Dining Out","caldarroste":"Dining Out",
+"merenda":"Dining Out","takeaway":"Dining Out","pub":"Dining Out","vino":"Dining Out","wine":"Dining Out",
+"pedaggio":"Transport","toll":"Transport","tolls":"Transport","parking":"Transport","petrol":"Transport",
+"diesel":"Transport","bus":"Transport","train":"Transport","flight":"Travel","flights":"Travel",
+"alloggio":"Travel","accommodation":"Travel","museo":"Entertainment","museum":"Entertainment",
+"biglietti":"Entertainment","tickets":"Entertainment","regalo":"Shopping","gift":"Shopping",
 }
 
 MERCHANT_NOISE={
@@ -278,16 +287,31 @@ def parse_csv_transactions(file_bytes):
                     "transaction_type":typ,"description":desc})
     return out
 
+_RAPID=None
+def _rapid_lines(image):
+    global _RAPID
+    from rapidocr_onnxruntime import RapidOCR
+    import numpy as np
+    if _RAPID is None: _RAPID=RapidOCR()
+    result,_=_RAPID(np.array(image))
+    return [str(x[1]) for x in result if len(x)>=2] if result else []
+
 def _ocr_text(image):
     # RapidOCR is the first choice because it does not require a system binary.
     try:
-        from rapidocr_onnxruntime import RapidOCR
         import numpy as np
-        result,_=RapidOCR()(np.array(image.convert('RGB')))
-        if result:
-            text='\n'.join(str(x[1]) for x in result if len(x)>=2)
-            if any(ch.isdigit() for ch in text):
-                return text
+        from PIL import ImageOps
+        rgb=image.convert('RGB')
+        passes=[rgb]
+        if np.array(rgb.convert('L')).mean()<110:      # dark-mode screenshot: light text on dark
+            passes.insert(0, ImageOps.invert(rgb))
+        best=[]
+        for img in passes:
+            lines=_rapid_lines(img)
+            if len(lines)>len(best): best=lines
+        text='\n'.join(best)
+        if any(ch.isdigit() for ch in text):
+            return text
     except Exception:
         pass
     if pytesseract is not None:
@@ -324,7 +348,67 @@ def _ocr_text(image):
             pass
     return ''
 
+_WEEKDAYS={"monday":0,"mon":0,"lunedì":0,"lunedi":0,"lun":0,"tuesday":1,"tue":1,"martedì":1,"martedi":1,
+"wednesday":2,"wed":2,"mercoledì":2,"mercoledi":2,"thursday":3,"thu":3,"giovedì":3,"giovedi":3,
+"friday":4,"fri":4,"venerdì":4,"venerdi":4,"saturday":5,"sat":5,"sabato":5,"sunday":6,"sun":6,"domenica":6}
+
+def relative_date(text, today=None):
+    """'Monday at 1:53 PM', 'Ieri', 'Today' -> a date. Weekday names mean the most recent such day."""
+    today=today or date.today()
+    s=re.sub(r"\s+","",(text or "").lower())
+    if s.startswith(("today","oggi")): return today
+    if s.startswith(("yesterday","ieri")): return today-timedelta(days=1)
+    for name in sorted(_WEEKDAYS, key=len, reverse=True):
+        if s.startswith(name):
+            return today-timedelta(days=(today.weekday()-_WEEKDAYS[name])%7)
+    return None
+
+_QUOTES="“”\"'‘’«»"
+_SPLIT_MARKERS=("nelgruppo","restituiti","devidare","yougetback","youowe","youlent","youborrowed","inthegroup")
+
+def is_split_bill(text):
+    flat=re.sub(r"\s+","",(text or "").lower())
+    return any(m in flat for m in _SPLIT_MARKERS)
+
+def split_bill_title(text):
+    """'Tu hai aggiunto "Aperitivo" nel gruppo "Trieste".' -> 'Aperitivo' (None when it is not such a line)."""
+    m=re.search(rf"(?:aggiunto|added|aggiornato|updated)\s*[{_QUOTES}]+\s*([^{_QUOTES}]+?)\s*[{_QUOTES}]", text or "", flags=re.I)
+    return m.group(1).strip() if m else None
+
+def _parse_split_bill(text, today=None):
+    """Activity list of a bill-splitting app (Splitwise style). Every entry is an expense,
+    named after the item, for the amount shown - whether it says you are owed or you owe."""
+    out=[]; cur=None
+    amount_re=re.compile(r"(\d{1,6}[.,]\d{2})(?!\d)(?!\s*[ap]m)", re.I)
+    def flush():
+        nonlocal cur
+        if cur and cur.get("amount"):
+            desc=cur.get("desc") or "Shared expense"
+            out.append({"transaction_date":cur.get("date") or (today or date.today()),"amount":cur["amount"],
+                        "category":auto_categorize(desc,"Expense"),"transaction_type":"Expense","description":desc})
+        cur=None
+    for line in [x.strip() for x in (text or "").splitlines() if x.strip()]:
+        flat=re.sub(r"\s+","",line.lower())
+        title=split_bill_title(line)
+        if title or re.search(r"aggiunto|added|hapagato|paid", flat):
+            flush(); cur={"desc":title}
+            continue
+        d=relative_date(line, today) or (extract_explicit_date(line) if not amount_re.search(line) else None)
+        if d:
+            if cur: cur["date"]=d
+            flush(); continue
+        m=amount_re.findall(line)
+        if m and any(k in flat for k in ("restituiti","devidare","getback","owe","lent","borrowed","€","eur")) or (m and cur is not None and not cur.get("amount")):
+            if cur and cur.get("amount"): flush()
+            if cur is None: cur={"desc":None}
+            cur["amount"]=abs(parse_amount(m[-1]) or 0)
+    flush()
+    return out
+
 def _parse_ocr_transactions(text):
+    if is_split_bill(text):
+        rows=_parse_split_bill(text)
+        if rows: return rows
     lines=[re.sub(r'\s+',' ',x).strip() for x in (text or '').splitlines() if x.strip()]
     out=[]; current_date=None; pending_desc=None
     amount_re=re.compile(r'(?<!\d)(?:[-+€$£]\s*)?(\d{1,6}(?:[.,]\d{2}))(?!\d)')
@@ -377,7 +461,12 @@ def _gemini_image_transactions(image):
             f"category must be exactly one of {EXPENSE_CATEGORIES} for expenses or one of {INCOME_CATEGORIES} for income; "
             "pick the best fit for the merchant (supermarkets=Groceries, fuel/ride-share/public transport=Transport, "
             "restaurants/cafes/food delivery=Dining Out, streaming/software=Subscriptions, phone/internet/power=Utilities). "
-            "Ignore rows marked REVERTED, REVERSED, CANCELLED, DECLINED or STORNATO and ignore balance lines. Do not invent values.")
+            "Ignore rows marked REVERTED, REVERSED, CANCELLED, DECLINED or STORNATO and ignore balance lines. Do not invent values. "
+            f"Today is {date.today():%A %Y-%m-%d}: a weekday name such as 'Monday at 1:53 PM' means the most recent such day. "
+            "SPECIAL CASE - bill-splitting apps (Splitwise, Tricount: lines like 'Tu hai aggiunto \"Aperitivo\" nel gruppo \"Trieste\"' "
+            "followed by 'Ti devono essere restituiti 10,00 €', 'Devi dare 7,40 €', 'you get back' or 'you owe'): output one entry per item, "
+            "ALWAYS type Expense (also when it says money is owed to the user), amount = the amount shown on that entry, "
+            "description = only the item name inside the first quotes (e.g. Aperitivo, Dinner, Fuel), never the group or person name.")
     try:
         response=client.models.generate_content(model=model,contents=[prompt,image])
         raw=re.sub(r'^```(?:json)?\s*|\s*```$','',(response.text or '').strip(),flags=re.I|re.S)
@@ -387,6 +476,7 @@ def _gemini_image_transactions(image):
             d=parse_date(row.get('date')); amount=parse_amount(row.get('amount')); desc=str(row.get('description') or '').strip()
             if d and amount is not None and desc:
                 typ='Income' if str(row.get('type','Expense')).lower().startswith('inc') else 'Expense'
+                if split_bill_title(desc): desc, typ=split_bill_title(desc), 'Expense'
                 kw=auto_categorize(desc, typ)
                 ai=str(row.get('category') or '').strip()
                 # Trust a specific keyword match; otherwise use Gemini's choice when it is valid.
